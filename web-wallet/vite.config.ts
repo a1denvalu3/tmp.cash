@@ -1,8 +1,32 @@
 import { defineConfig } from "vitest/config";
 import react from "@vitejs/plugin-react";
 import { fileURLToPath } from "node:url";
+import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+
+const version = JSON.parse(
+  readFileSync(new URL("./package.json", import.meta.url), "utf8"),
+).version;
+const revision = (() => {
+  try {
+    return execFileSync("git", ["rev-parse", "--short=12", "HEAD"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    return "unknown";
+  }
+})();
 
 export default defineConfig(({ command }) => ({
+  define: {
+    "import.meta.env.VITE_WALLET_BUILD": JSON.stringify(
+      `${version}+${revision}`,
+    ),
+    "import.meta.env.VITE_WALLET_BUILT_AT": JSON.stringify(
+      new Date().toISOString(),
+    ),
+  },
   plugins: [
     react(),
     {
