@@ -60,6 +60,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--host", default=configuration.get("TMP_CASH_MINT_HOST") or "127.0.0.1"
     )
     parser.add_argument(
+        "--fake-auto-accept",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="automatically accept open fake funding invoices (default: off)",
+    )
+    parser.add_argument(
         "--port", type=int, default=configuration.get("TMP_CASH_MINT_PORT") or "3338"
     )
     parser.set_defaults(admin_token=configuration.get("TMP_CASH_ADMIN_TOKEN") or None)
@@ -119,8 +125,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="private regtest operator, SSP and Esplora connection JSON",
     )
     args = parser.parse_args(argv)
+    if args.fake_auto_accept is None:
+        configured = (
+            (configuration.get("TMP_CASH_FAKE_AUTO_ACCEPT") or "false").strip().lower()
+        )
+        if configured not in {"true", "false", "1", "0", "yes", "no", "on", "off"}:
+            parser.error("TMP_CASH_FAKE_AUTO_ACCEPT must be true or false")
+        args.fake_auto_accept = configured in {"true", "1", "yes", "on"}
     if args.backend not in {"fake", "lnd", "spark"}:
         parser.error("TMP_CASH_MINT_BACKEND must be fake, lnd or spark")
+    if args.fake_auto_accept and args.backend != "fake":
+        parser.error("--fake-auto-accept requires --backend fake")
     if not 0 <= args.port <= 65535:
         parser.error("mint port must be between 0 and 65535")
     if args.fee_limit_sat < 0:
@@ -194,7 +209,11 @@ def create_backend(args: argparse.Namespace) -> HoldInvoiceBackend:
             args.fee_limit_sat,
             connection,
         )
-    return FakeBackend(args.data / "fake.sqlite3", fee_limit_sat=args.fee_limit_sat)
+    return FakeBackend(
+        args.data / "fake.sqlite3",
+        fee_limit_sat=args.fee_limit_sat,
+        auto_accept=args.fake_auto_accept,
+    )
 
 
 def main() -> None:
@@ -223,6 +242,8 @@ def main() -> None:
             "The existing database and seed must be retained for the old protocol."
         ) from None
     print(f"Mint backend: {args.backend}", file=sys.stderr)
+    if args.backend == "fake" and args.fake_auto_accept:
+        print("Fake funding: auto-accept enabled", file=sys.stderr)
     uvicorn.run(
         create_app(mint, report_balances=True, admin_token=args.admin_token),
         host=args.host,

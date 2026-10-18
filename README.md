@@ -102,6 +102,23 @@ node or server is needed.
 poetry run tmp.cash-mint --backend fake --data data/mint-v3
 ```
 
+For manual testing with the web wallet, enable automatic fake funding:
+
+```bash
+poetry run tmp.cash-mint --backend fake --data data/local-fake --fake-auto-accept
+```
+
+This accepts each open, unexpired fake funding invoice when it is created or
+checked, including existing waiting invoices after a restart with the option
+enabled. The web wallet can mint ecash automatically on its next payment check.
+The hold stays `ACCEPTED`; normal settlement and expiry still apply. Canceled,
+expired, and settled invoices stay closed. It uses simulated sats throughout.
+
+You can also set `TMP_CASH_FAKE_AUTO_ACCEPT=true` in `.env` or the environment.
+`--no-fake-auto-accept` overrides that setting. The default is off, retaining
+explicit `tmp.cash dev-accept` control for tests of unpaid invoices and delayed
+payments. This setting requires the fake backend.
+
 For LND, copy `.env.example` to `.env`, configure the node's REST endpoint,
 TLS certificate and macaroon, and choose a **new v3 mint directory**:
 
