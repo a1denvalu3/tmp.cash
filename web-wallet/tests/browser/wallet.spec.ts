@@ -694,7 +694,7 @@ test("exports a real encrypted wallet backup and restores it in an empty browser
   await expect(restored.getByTestId("balance")).toHaveText("54sats");
   await restored.getByRole("button", { name: "Activity", exact: true }).click();
   await expect(
-    restored.getByRole("button", { name: "View token" }),
+    restored.getByRole("button", { name: /^View Sent ecash details/ }),
   ).toBeVisible();
   await context.close();
 });
