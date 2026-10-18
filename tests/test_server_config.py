@@ -18,6 +18,7 @@ def isolated_configuration(tmp_path, monkeypatch):
         "TMP_CASH_MINT_DATA",
         "TMP_CASH_MINT_HOST",
         "TMP_CASH_MINT_PORT",
+        "TMP_CASH_FAKE_AUTO_ACCEPT",
         "TMP_CASH_ADMIN_TOKEN",
         "TMP_CASH_LND_ENDPOINT",
         "TMP_CASH_LND_CERT",
@@ -196,6 +197,60 @@ def test_time_based_backend_does_not_advertise_a_block_lifetime(tmp_path):
     assert info["default_token_lifetime_blocks"] is None
     assert info["funding_htlc_cltv_delta"] is None
     assert info["settle_margin_seconds"] == 120
+
+
+def test_fake_auto_accept_is_explicit_and_cli_overrides_configuration(
+    tmp_path, monkeypatch
+):
+    assert parse_args([]).fake_auto_accept is False
+    assert create_backend(parse_args([])).auto_accept is False
+    (tmp_path / ".env").write_text("TMP_CASH_FAKE_AUTO_ACCEPT=true\n")
+    assert parse_args([]).fake_auto_accept is True
+    assert create_backend(parse_args([])).auto_accept is True
+    assert parse_args(["--no-fake-auto-accept"]).fake_auto_accept is False
+    monkeypatch.setenv("TMP_CASH_FAKE_AUTO_ACCEPT", "false")
+    assert parse_args([]).fake_auto_accept is False
+    assert parse_args(["--fake-auto-accept"]).fake_auto_accept is True
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("true", True),
+        ("1", True),
+        ("yes", True),
+        ("on", True),
+        ("false", False),
+        ("0", False),
+        ("no", False),
+        ("off", False),
+        (" TRUE ", True),
+    ],
+)
+def test_fake_auto_accept_boolean_values(monkeypatch, value, expected):
+    monkeypatch.setenv("TMP_CASH_FAKE_AUTO_ACCEPT", value)
+    assert parse_args([]).fake_auto_accept is expected
+
+
+def test_fake_auto_accept_accepts_legacy_prefix(monkeypatch):
+    monkeypatch.setenv("CASHU_FAKE_AUTO_ACCEPT", "true")
+    assert parse_args([]).fake_auto_accept is True
+    monkeypatch.setenv("TMP_CASH_FAKE_AUTO_ACCEPT", "false")
+    assert parse_args([]).fake_auto_accept is False
+
+
+def test_invalid_fake_auto_accept_configuration_fails(monkeypatch):
+    monkeypatch.setenv("TMP_CASH_FAKE_AUTO_ACCEPT", "sometimes")
+    with pytest.raises(SystemExit) as exc:
+        parse_args([])
+    assert exc.value.code == 2
+    assert parse_args(["--no-fake-auto-accept"]).fake_auto_accept is False
+
+
+def test_fake_auto_accept_cannot_be_enabled_for_real_backends():
+    with pytest.raises(SystemExit) as exc:
+        parse_args(["--backend", "lnd", "--fake-auto-accept"])
+    assert exc.value.code == 2
 
 
 @pytest.mark.parametrize(

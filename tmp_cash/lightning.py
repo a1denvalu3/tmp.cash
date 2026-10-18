@@ -114,13 +114,23 @@ class FakeBackend(HoldInvoiceBackend):
 
     name = "fake"
 
-    def __init__(self, path: Path, fee_msat: int = 0, fee_limit_sat: int = 10):
+    def __init__(
+        self,
+        path: Path,
+        fee_msat: int = 0,
+        fee_limit_sat: int = 10,
+        *,
+        auto_accept: bool = False,
+    ):
         if type(fee_msat) is not int or fee_msat < 0:
             raise ValueError("fake routing fee must be nonnegative millisatoshis")
         self.fee_msat = fee_msat
         if type(fee_limit_sat) is not int or fee_limit_sat < 0:
             raise ValueError("routing fee limit must be nonnegative satoshis")
         self.fee_limit_sat = fee_limit_sat
+        if type(auto_accept) is not bool:
+            raise ValueError("fake auto-accept must be a boolean")
+        self.auto_accept = auto_accept
         self.db = Database(path)
         with self.db.read() as conn:
             conn.executescript(
@@ -220,6 +230,19 @@ class FakeBackend(HoldInvoiceBackend):
                     InvoiceState.accepted.value,
                 ),
             )
+            if self.auto_accept:
+                # Keep the normal ACCEPTED hold lifecycle. Terminal invoices
+                # stay closed, including invoices expired by the query above.
+                conn.execute(
+                    "UPDATE invoices SET state=?,amount_paid=amount "
+                    "WHERE payment_hash=? AND state=? AND expiry>?",
+                    (
+                        InvoiceState.accepted.value,
+                        payment_hash,
+                        InvoiceState.open.value,
+                        int(time.time()),
+                    ),
+                )
             row = conn.execute(
                 "SELECT * FROM invoices WHERE payment_hash=?", (payment_hash,)
             ).fetchone()
