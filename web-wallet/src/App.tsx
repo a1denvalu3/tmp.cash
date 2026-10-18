@@ -55,6 +55,14 @@ import { useTheme } from "./theme";
 import { TmpCashMark } from "./TmpCashMark";
 import { expiredBackings, type ExpiredBacking } from "./backings";
 import { InvoiceScanner } from "./InvoiceScanner";
+import { DiagnosticsPanel } from "./DiagnosticsPanel";
+import {
+  diagnoseAction,
+  diagnosticError,
+  diagnosticFetch,
+  walletDiagnostics,
+  type DiagnosticAction,
+} from "./diagnostics";
 
 const repo = new TmpCashIndexedDbRepository();
 const defaultMint =
@@ -370,9 +378,8 @@ export function App() {
     setLnurlLoading(true);
     const timer = setTimeout(async () => {
       try {
-        const request = await psLnurlPayRequest(
-          paymentTarget.url,
-          controller.signal,
+        const request = await diagnoseAction("lookup-payment", () =>
+          psLnurlPayRequest(paymentTarget.url, controller.signal),
         );
         if (!controller.signal.aborted) {
           setLnurl(request);
@@ -400,10 +407,56 @@ export function App() {
 
   useEffect(() => {
     let active = true;
-    const m = new TmpCashManager(repo, mintUrl);
+    let previousBalance = "";
+    const observedQuotes = new Set<string>();
+    const m = new TmpCashManager(repo, mintUrl, diagnosticFetch);
     const update = async () => {
-      const v = await m.view();
-      if (active) setView(v);
+      try {
+        const v = await m.view();
+        if (active) {
+          setView(v);
+          const balance = {
+            balance: v.balance,
+            redeemable: v.redeemable,
+            reserved: v.reserved,
+            sent: v.sent,
+            expired: v.expired,
+            verified: v.verified,
+          };
+          const identity = JSON.stringify(balance);
+          if (identity !== previousBalance) {
+            walletDiagnostics.record("wallet.balance", balance);
+            previousBalance = identity;
+          }
+          // Select only quote metadata; funding and operation records also
+          // contain preimages, proofs, and prepared request secrets.
+          const quotes = [
+            ...v.fundings.filter((f) => f.mint === mintUrl).map((f) => f.quote),
+            ...v.operations
+              .filter((o) => o.mint === mintUrl)
+              .map((o) => (o.payload.kind === "swap" ? null : o.payload.quote)),
+          ];
+          for (const quote of quotes) {
+            if (!quote || observedQuotes.has(quote.quote)) continue;
+            walletDiagnostics.record("quote.observed", {
+              invoice: quote.request,
+              quoteId: quote.quote,
+            });
+            observedQuotes.add(quote.quote);
+          }
+        }
+      } catch (err) {
+        walletDiagnostics.record("action.failed", {
+          action: "read-wallet",
+          ...diagnosticError(err),
+        });
+        if (active)
+          setConnectionError(
+            err instanceof Error
+              ? err.message
+              : "Could not read wallet storage",
+          );
+      }
     };
     const unsubscribe = m.events.on("change", update);
     setConnecting(true);
@@ -412,7 +465,7 @@ export function App() {
     (async () => {
       await update();
       try {
-        await m.init();
+        await diagnoseAction("connect", () => m.init());
         if (active) {
           setManager(m);
           setConnectionError("");
@@ -431,7 +484,7 @@ export function App() {
     })();
     const refresh = setInterval(() => {
       if (active && !busyRef.current && m.wallet.keysetId)
-        m.refresh()
+        diagnoseAction("refresh", () => m.refresh())
           .then(() => {
             if (active) {
               setManager(m);
@@ -465,7 +518,9 @@ export function App() {
           (f) => f.mint === mintUrl && f.state === "waiting",
         )) {
           try {
-            const result = await manager.pollFunding(f.id);
+            const result = await diagnoseAction("check-funding", () =>
+              manager.pollFunding(f.id),
+            );
             if (active) {
               setFunding((current) =>
                 current?.id === result.id ? result : current,
@@ -482,6 +537,10 @@ export function App() {
           }
         }
       } catch (err) {
+        walletDiagnostics.record("action.failed", {
+          action: "read-wallet",
+          ...diagnosticError(err),
+        });
         if (active && dialog === "fund")
           setError(err instanceof Error ? err.message : "Funding check failed");
       } finally {
@@ -495,13 +554,16 @@ export function App() {
     };
   }, [manager, mintUrl, dialog]);
 
-  async function run<T>(fn: () => Promise<T>): Promise<T | undefined> {
+  async function run<T>(
+    action: DiagnosticAction,
+    fn: () => Promise<T>,
+  ): Promise<T | undefined> {
     if (busyRef.current) return;
     busyRef.current = true;
     setBusy(true);
     setError("");
     try {
-      return await fn();
+      return await diagnoseAction(action, fn);
     } catch (err) {
       if (isPSPendingMeltError(err)) {
         setDialog(null);
@@ -556,6 +618,10 @@ export function App() {
       setNotice("Mint saved. Connecting…");
       setError("");
     } catch (err) {
+      walletDiagnostics.record("action.failed", {
+        action: "save-mint",
+        ...diagnosticError(err),
+      });
       setError(err instanceof Error ? err.message : "Invalid URL");
     }
   }
@@ -855,7 +921,7 @@ export function App() {
                       className="button secondary"
                       disabled={busy || !manager}
                       onClick={() =>
-                        run(async () => {
+                        run("retry", async () => {
                           const result = await manager!.retry(o.id);
                           if (result.token) showToken(result.token);
                           else setNotice("Operation completed.");
@@ -904,7 +970,7 @@ export function App() {
                     className="icon-button"
                     disabled={busy || !manager}
                     aria-label="Refresh backing status"
-                    onClick={() => run(() => manager!.refresh())}
+                    onClick={() => run("refresh", () => manager!.refresh())}
                   >
                     <RefreshCw size={16} />
                   </button>
@@ -1250,6 +1316,7 @@ export function App() {
                   do not extend token deadlines.
                 </p>
               </section>
+              <DiagnosticsPanel />
             </div>
           </>
         )}
@@ -1343,7 +1410,7 @@ export function App() {
               <form
                 onSubmit={(e) => {
                   e.preventDefault();
-                  run(async () => {
+                  run("create-funding", async () => {
                     setFunding(await manager!.createFunding(Number(amount)));
                   });
                 }}
@@ -1427,7 +1494,7 @@ export function App() {
                   className="button secondary full"
                   disabled={busy || !manager}
                   onClick={() =>
-                    run(async () =>
+                    run("check-funding", async () =>
                       setFunding(await manager!.pollFunding(funding.id)),
                     )
                   }
@@ -1453,7 +1520,7 @@ export function App() {
             <form
               onSubmit={(e) => {
                 e.preventDefault();
-                run(async () => {
+                run("send", async () => {
                   const token = await manager!.send(
                     Number(amount),
                     selectedHash || undefined,
@@ -1511,7 +1578,7 @@ export function App() {
               onSubmit={(e) => {
                 e.preventDefault();
                 if (!incomingToken.token || !manager) return;
-                run(async () => {
+                run("receive", async () => {
                   const encoded = tokenText;
                   const token = manager!.wallet.verifyToken(
                     decodePSToken(encoded),
@@ -1610,7 +1677,7 @@ export function App() {
               <form
                 onSubmit={(e) => {
                   e.preventDefault();
-                  run(async () => {
+                  run("quote-payment", async () => {
                     const version = ++meltQuoteVersion.current;
                     try {
                       const target = psLightningTarget(invoice);
@@ -1625,6 +1692,10 @@ export function App() {
                       }
                       if (meltQuoteVersion.current !== version) return;
                       const nextQuote = await manager!.meltQuote(request);
+                      walletDiagnostics.record("quote.observed", {
+                        invoice: nextQuote.request,
+                        quoteId: nextQuote.quote,
+                      });
                       if (meltQuoteVersion.current === version)
                         setQuote(nextQuote);
                     } catch (err) {
@@ -1752,7 +1823,7 @@ export function App() {
                     view.redeemable < quote.amount + quote.fee_reserve
                   }
                   onClick={() =>
-                    run(async () => {
+                    run("pay", async () => {
                       const receipt = await manager!.melt(quote);
                       setDialog(null);
                       setNotice(
@@ -1807,7 +1878,7 @@ export function App() {
             <form
               onSubmit={(e) => {
                 e.preventDefault();
-                run(async () => {
+                run("add-preimage", async () => {
                   await manager!.attachPreimage(
                     selectedHash,
                     tokenText.trim().toLowerCase(),
@@ -1838,7 +1909,7 @@ export function App() {
             <form
               onSubmit={(e) => {
                 e.preventDefault();
-                run(async () => {
+                run(dialog, async () => {
                   if (dialog === "backup") {
                     const text = await encryptBackup(
                         await repo.read(),

@@ -2,6 +2,11 @@ import { useEffect, useRef, useState } from "react";
 import { Camera, Upload } from "lucide-react";
 import QrScanner from "qr-scanner";
 import { psLightningTarget } from "@cashu/cashu-ts/tmp-cash";
+import {
+  diagnosticError,
+  walletDiagnostics,
+  diagnoseAction,
+} from "./diagnostics";
 
 function invoiceFromQR(value: string): string {
   const invoice = value.trim().replace(/^lightning:/i, "");
@@ -68,7 +73,7 @@ export function InvoiceScanner({
       },
     );
     scanner.setInversionMode("both");
-    scanner.start().catch(() => {
+    diagnoseAction("qr-camera", () => scanner.start()).catch(() => {
       if (!active) return;
       setScanning(false);
       setError(
@@ -101,6 +106,10 @@ export function InvoiceScanner({
       if (request !== imageRequest.current) return;
       onScan(invoiceFromQR(data));
     } catch (err) {
+      walletDiagnostics.record("action.failed", {
+        action: "qr-image",
+        ...diagnosticError(err),
+      });
       if (request === imageRequest.current) setError((err as Error).message);
     } finally {
       if (request === imageRequest.current) setReading(false);
