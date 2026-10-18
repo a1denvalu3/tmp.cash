@@ -884,6 +884,9 @@ p {
 .appearance-card {
   grid-column: 1 / -1;
 }
+.diagnostics-card {
+  grid-column: 1 / -1;
+}
 .theme-options {
   min-width: 0;
   display: grid;

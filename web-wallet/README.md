@@ -110,6 +110,30 @@ over HTTPS and use an HTTPS mint; browsers block mixed-content requests.
   backing preimages, pending request secrets, and the outgoing token history.
   Restore requires an empty wallet in a new browser profile. A snapshot backup
   cannot recover operations created after it was downloaded.
+- **Debug logs:** in Settings, choose **Copy debug logs** and paste the report
+  into your support chat, or choose **Download logs** to share a JSON file.
+  A selectable report appears if clipboard access is unavailable. Logs also
+  remain accessible from the recovery screen if the wallet UI crashes.
+
+Diagnostics run locally with no automatic upload or analytics service. The
+report includes the wallet version, Git revision, build time, browser family
+and major version, browser capabilities, action outcomes, HTTP status codes,
+request timings, error categories, Lightning invoices, quote IDs, and balance
+changes (including reserved, redeemable, sent, and expired amounts, plus whether
+the balance is verified). It keeps up to 200 events from the past 24 hours,
+bounded to 150 KB, across reloads, with an in-memory fallback when browser storage
+is blocked or full. **Clear logs** removes the diagnostic history; it does not
+change wallet data. Export logs soon after a problem, before newer events
+replace it.
+
+Diagnostic fields and error messages use explicit allowlists. Reports omit
+tokens, proofs, preimages, credentials, passwords, operation IDs, mint URLs,
+full request/response bodies, and arbitrary error text. Invoice and quote fields
+are selected explicitly; no proof or request object is copied into the logs.
+Quote lookup paths replace their ID with `:id` and record the quote ID in its
+own field; stack locations retain only bundle labels and numeric positions. Browser session IDs
+are randomly generated for diagnostics and have no connection to wallet funds.
+Logs are separate from encrypted wallet backups and cannot restore funds.
 
 The wallet verifies credentials and refreshes backing and nullifier status.
 Expired, settled, canceled, sent, reserved, or remotely pending proofs are

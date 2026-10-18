@@ -7,6 +7,8 @@ import "@fontsource/dm-sans/700.css";
 import "@fontsource/dm-mono/400.css";
 import "./style.css";
 import "./theme";
+import { startWalletDiagnostics } from "./diagnostics";
+import { WalletErrorBoundary } from "./WalletErrorBoundary";
 
 const Wallet = lazy(() =>
   import("./App").then(({ App }) => ({ default: App })),
@@ -22,6 +24,7 @@ const Cryptography = lazy(() =>
 const root = document.getElementById("root")!;
 const isWallet = root.dataset.page === "wallet";
 const isCryptography = root.dataset.page === "cryptography";
+if (isWallet) startWalletDiagnostics();
 
 // Some static hosts serve the landing entry before normalizing a directory URL.
 if (["/wallet", "/how-it-works"].includes(window.location.pathname)) {
@@ -39,7 +42,9 @@ if (["/wallet", "/how-it-works"].includes(window.location.pathname)) {
         }
       >
         {isWallet ? (
-          <Wallet />
+          <WalletErrorBoundary>
+            <Wallet />
+          </WalletErrorBoundary>
         ) : isCryptography ? (
           <Cryptography />
         ) : (
