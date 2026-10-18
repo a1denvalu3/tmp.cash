@@ -106,6 +106,18 @@ over HTTPS and use an HTTPS mint; browsers block mixed-content requests.
 - **Appearance:** use the header’s sun/moon button to switch modes, or choose
   Light, Night, or System in Settings. The preference is saved in this browser;
   System follows your device’s color scheme.
+- **Activity details:** click an entry in recent activity or the Activity tab,
+  or focus it and press Enter, to open its receipt. It shows the amount, status,
+  full start/completion times, mint, invoice and quote ID when applicable,
+  backing hashes and amounts, recorded redemption deadlines, and the associated
+  ecash token. Outgoing Lightning payments include fees, change, the payout hash,
+  and the mint-returned payment preimage; the wallet verifies that the preimage
+  hashes to the invoice's payment hash. Invoices, tokens, IDs, hashes, and the
+  preimage have individual copy controls.
+  New history details survive reloads, offline use, saved-request retries, and
+  encrypted backups. Historical tokens may already be spent or expired; incoming
+  tokens were exchanged for fresh proofs. Older entries remain readable and
+  clearly indicate details that were not recorded.
 - **Settings:** exports/restores password-encrypted backups containing proofs,
   backing preimages, pending request secrets, and the outgoing token history.
   Restore requires an empty wallet in a new browser profile. A snapshot backup

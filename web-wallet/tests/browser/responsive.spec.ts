@@ -264,7 +264,7 @@ test("keeps funding, token, payment and backup dialogs usable in short and narro
   await expectContained(page, ".invoice-history-row, .invoice-history-details");
   await page.getByRole("button", { name: "Close dialog" }).click();
   await page.getByRole("button", { name: "Activity", exact: true }).click();
-  await page.getByRole("button", { name: "View token" }).click();
+  await page.getByRole("button", { name: /^View Sent ecash details/ }).click();
   await expectScrollableDialog(page);
   await page.getByRole("button", { name: "Close dialog" }).click();
   await page.getByRole("button", { name: "Settings", exact: true }).click();

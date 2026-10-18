@@ -12,11 +12,9 @@ import {
   ArrowDownLeft,
   ArrowUpRight,
   ArrowRight,
-  Check,
   CheckCircle2,
   ChevronRight,
   Clock3,
-  Copy,
   Download,
   Layers3,
   LoaderCircle,
@@ -33,7 +31,6 @@ import {
 import QRCode from "qrcode";
 import {
   TmpCashManager,
-  type TmpCashActivity,
   type TmpCashFunding,
   type TmpCashView,
 } from "coco-cashu-core/tmp-cash";
@@ -53,8 +50,15 @@ import {
 import { decryptBackup, encryptBackup, MAX_BACKUP_LENGTH } from "./backup";
 import { useTheme } from "./theme";
 import { TmpCashMark } from "./TmpCashMark";
-import { expiredBackings, type ExpiredBacking } from "./backings";
+import { expiredBackings } from "./backings";
 import { InvoiceScanner } from "./InvoiceScanner";
+import { CopyButton } from "./CopyButton";
+import { ActivityDetails } from "./ActivityDetails";
+import {
+  purposeNames,
+  type WalletActivity,
+  type ExpiryActivity,
+} from "./activity";
 import { DiagnosticsPanel } from "./DiagnosticsPanel";
 import {
   diagnoseAction,
@@ -92,6 +96,7 @@ const short = (hash: string) => hash.slice(0, 8) + "…" + hash.slice(-6);
 type Dialog =
   | "fund"
   | "funding-history"
+  | "activity"
   | "send"
   | "receive"
   | "pay"
@@ -100,19 +105,6 @@ type Dialog =
   | "token"
   | "preimage"
   | null;
-const purposeNames = {
-  mint: "Added ecash",
-  send: "Sent ecash",
-  receive: "Received ecash",
-  melt: "Lightning payment",
-  expire: "Backing expired",
-};
-type ExpiryActivity = ExpiredBacking & {
-  id: string;
-  purpose: "expire";
-  createdAt: number | null;
-};
-type WalletActivity = TmpCashActivity | ExpiryActivity;
 
 function observedLabel(timestamp: number | null): string {
   return timestamp === null
@@ -210,54 +202,25 @@ function QR({ value }: { value: string }) {
     <p className="muted small">Use the copy button to share this payload.</p>
   );
 }
-function CopyButton({
-  value,
-  label = "Copy",
-}: {
-  value: string;
-  label?: string;
-}) {
-  const [copied, setCopied] = useState(false),
-    [error, setError] = useState("");
-  return (
-    <>
-      <button
-        type="button"
-        className="button secondary"
-        onClick={async () => {
-          try {
-            await navigator.clipboard.writeText(value);
-            setCopied(true);
-            setTimeout(() => setCopied(false), 2000);
-          } catch {
-            setError("Select and copy the text below.");
-          }
-        }}
-      >
-        {copied ? <Check size={16} /> : <Copy size={16} />}
-        {copied ? "Copied" : label}
-      </button>
-      {error && (
-        <p role="status" className="small">
-          {error}
-        </p>
-      )}
-    </>
-  );
-}
 function ActivityRow({
   row,
-  showToken,
+  showDetails,
 }: {
   row: WalletActivity;
-  showToken: (value: string) => void;
+  showDetails: (row: WalletActivity) => void;
 }) {
   const incoming = row.purpose === "mint" || row.purpose === "receive";
   const expiry = row.purpose === "expire" ? row : null;
   const sharedOnly = expiry !== null && row.amount === 0;
   const amount = `${incoming ? "+" : sharedOnly ? "" : "−"}${format(sharedOnly ? expiry.sharedAmount : row.amount)}`;
   return (
-    <div className="activity-row">
+    <button
+      type="button"
+      className="activity-row"
+      aria-haspopup="dialog"
+      aria-label={`View ${purposeNames[row.purpose]} details, ${amount} sats`}
+      onClick={() => showDetails(row)}
+    >
       <span
         className={`transaction-icon ${expiry ? "expired" : incoming ? "incoming" : ""}`}
       >
@@ -271,7 +234,7 @@ function ActivityRow({
           <ArrowUpRight size={20} />
         )}
       </span>
-      <div className="activity-name">
+      <span className="activity-name">
         <strong>{purposeNames[row.purpose]}</strong>
         <span className="small muted">
           {expiry
@@ -294,16 +257,11 @@ function ActivityRow({
               : ""}
           </span>
         )}
-      </div>
-      {"token" in row && row.token && (
-        <button
-          className="text-button small"
-          onClick={() => showToken(row.token!)}
-        >
-          View token <ChevronRight size={14} />
-        </button>
-      )}
-      <div className="activity-value">
+      </span>
+      <span className="text-button small" aria-hidden="true">
+        Details <ChevronRight size={14} />
+      </span>
+      <span className="activity-value">
         <strong>
           <span className="activity-amount" style={amountStyle(amount)}>
             {amount}
@@ -319,8 +277,8 @@ function ActivityRow({
               ? "Shared token"
               : "Completed"}
         </span>
-      </div>
-    </div>
+      </span>
+    </button>
   );
 }
 
@@ -332,6 +290,8 @@ export function App() {
     [view, setView] = useState<TmpCashView | null>(null);
   const [tab, setTab] = useState<"wallet" | "activity" | "settings">("wallet"),
     [dialog, setDialog] = useState<Dialog>(null);
+  const [selectedActivity, setSelectedActivity] =
+    useState<WalletActivity | null>(null);
   const [busy, setBusy] = useState(false),
     [connecting, setConnecting] = useState(true),
     [connectionError, setConnectionError] = useState("");
@@ -603,6 +563,10 @@ export function App() {
   function showToken(value: string) {
     open("token");
     setTokenText(value);
+  }
+  function showActivity(row: WalletActivity) {
+    open("activity");
+    setSelectedActivity(row);
   }
   function showFunding(value: TmpCashFunding) {
     open("fund");
@@ -1164,7 +1128,11 @@ export function App() {
                 </button>
               </div>
               {localActivity.slice(0, 3).map((row) => (
-                <ActivityRow key={row.id} row={row} showToken={showToken} />
+                <ActivityRow
+                  key={row.id}
+                  row={row}
+                  showDetails={showActivity}
+                />
               ))}
               {!localActivity.length && (
                 <p className="quiet-empty">
@@ -1190,7 +1158,11 @@ export function App() {
             <section className="activity-section">
               {localActivity.length ? (
                 localActivity.map((row) => (
-                  <ActivityRow key={row.id} row={row} showToken={showToken} />
+                  <ActivityRow
+                    key={row.id}
+                    row={row}
+                    showDetails={showActivity}
+                  />
                 ))
               ) : (
                 <div className="empty-state">
@@ -1343,6 +1315,9 @@ export function App() {
                   ? "Sats in your pocket."
                   : "Add sats.",
               "funding-history": "Deposit invoice history.",
+              activity: selectedActivity
+                ? purposeNames[selectedActivity.purpose]
+                : "Activity details",
               send: "Pass it on.",
               receive: "Receive ecash.",
               pay: quote ? "Ready to pay?" : "Pay with Lightning.",
@@ -1357,6 +1332,7 @@ export function App() {
               fund: "Fund a hold invoice. Your ecash appears when the payment is held.",
               "funding-history":
                 "Invoices created on this device for this mint, newest first.",
+              activity: "Your saved transaction details.",
               send: "Create a fresh token to share. Send from one backing at a time.",
               receive:
                 "Paste an ecash token. We’ll refresh its proofs before adding it.",
@@ -1370,6 +1346,9 @@ export function App() {
             }[dialog]
           }
         >
+          {dialog === "activity" && selectedActivity && (
+            <ActivityDetails row={selectedActivity} view={view} />
+          )}
           {error && (
             <div className="banner error" role="alert">
               {error}
