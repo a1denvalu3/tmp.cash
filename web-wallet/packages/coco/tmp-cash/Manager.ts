@@ -27,6 +27,7 @@ import type {
   TmpCashOperation,
   TmpCashProofRecord,
   TmpCashActivity,
+  TmpCashActivityBacking,
 } from "./types";
 
 export class TmpCashManager {
@@ -497,9 +498,11 @@ export class TmpCashManager {
         receipt: null,
       };
       let proofs: TmpCashProofRecord[];
+      let historyToken: PSToken;
       if (op.payload.kind === "mint") {
         const token = await this.wallet.finishMint(op.payload);
         proofs = token.proofs.map((p) => this.record(p));
+        historyToken = token;
       } else if (op.payload.kind === "swap") {
         const token = await this.wallet.finishSwap(op.payload);
         proofs = token.proofs.map((p, i) =>
@@ -514,11 +517,40 @@ export class TmpCashManager {
             this.token(token.proofs.slice(0, op.sendCount)),
           );
         }
+        historyToken =
+          op.purpose === "send"
+            ? decodePSToken(activity.token!)
+            : op.payload.token;
       } else {
         const result = await this.finishMelt(op.payload);
         activity.receipt = result.receipt;
         proofs = result.token?.proofs.map((p) => this.record(p)) ?? [];
+        historyToken = op.payload.token;
       }
+      const backings = new Map<string, TmpCashActivityBacking>();
+      for (const proof of historyToken.proofs) {
+        const saved = backings.get(proof.payment_hash);
+        if (saved) saved.amount += proof.amount;
+        else
+          backings.set(proof.payment_hash, {
+            paymentHash: proof.payment_hash,
+            backingAmount: proof.backing_amount,
+            amount: proof.amount,
+            snapshot:
+              op.payload.kind === "swap"
+                ? op.payload.backing
+                : (this.snapshot?.htlcs.find(
+                    (backing) => backing.payment_hash === proof.payment_hash,
+                  ) ?? null),
+          });
+      }
+      activity.details = {
+        completedAt: Math.max(op.createdAt, Date.now()),
+        invoice: op.payload.kind === "swap" ? null : op.payload.quote.request,
+        quoteId: op.payload.kind === "swap" ? null : op.payload.quote.quote,
+        token: op.purpose === "send" ? null : encodePSToken(historyToken),
+        backings: [...backings.values()],
+      };
       await this.repo.complete(op, proofs, activity);
       await this.changed();
       // A successful receipt remains successful even when the follow-up snapshot is offline.

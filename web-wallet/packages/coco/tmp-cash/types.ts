@@ -4,6 +4,7 @@ import type {
   PSQuote,
   PSReceipt,
   PSSnapshot,
+  PSBacking,
 } from "@cashu/cashu-ts/tmp-cash";
 
 export type TmpCashProofState =
@@ -43,6 +44,19 @@ export interface TmpCashOperation {
   createdAt: number;
   error: string | null;
 }
+export interface TmpCashActivityBacking {
+  paymentHash: string;
+  backingAmount: number;
+  amount: number;
+  snapshot: PSBacking | null;
+}
+export interface TmpCashActivityDetails {
+  completedAt: number;
+  invoice: string | null;
+  quoteId: string | null;
+  token: string | null;
+  backings: TmpCashActivityBacking[];
+}
 export interface TmpCashActivity {
   id: string;
   mint: string;
@@ -52,6 +66,8 @@ export interface TmpCashActivity {
   state: "complete" | "sent";
   token: string | null;
   receipt: PSReceipt | null;
+  /** Absent on history written before activity details were introduced. */
+  details?: TmpCashActivityDetails;
 }
 export interface TmpCashState {
   proofs: TmpCashProofRecord[];

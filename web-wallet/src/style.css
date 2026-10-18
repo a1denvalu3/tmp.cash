@@ -727,11 +727,54 @@ p {
   margin-bottom: 50px;
 }
 .activity-row {
+  width: 100%;
+  text-align: left;
+  background: transparent;
   padding: 18px 0;
   border-top: 1px solid var(--line);
   display: flex;
   gap: 13px;
   align-items: center;
+}
+.activity-row:hover {
+  background: var(--surface);
+}
+.activity-details {
+  min-width: 0;
+}
+.activity-facts {
+  margin: 20px 0;
+  font-size: 12px;
+}
+.activity-facts > div {
+  display: grid;
+  grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr);
+  gap: 12px;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--line);
+}
+.activity-facts dt {
+  color: var(--muted);
+}
+.activity-facts dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.activity-detail-section {
+  border-top: 1px solid var(--line);
+  margin-top: 24px;
+  padding-top: 16px;
+}
+.activity-detail-section h3 {
+  margin: 0 0 10px;
+  font-size: 17px;
+}
+.activity-payload .button {
+  margin-top: 8px;
+}
+.activity-backing + .activity-backing {
+  border-top: 1px solid var(--line);
+  margin-top: 20px;
 }
 .transaction-icon {
   height: 39px;

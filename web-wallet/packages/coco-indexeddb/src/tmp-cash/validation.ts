@@ -4,6 +4,7 @@ import {
   quoteSchema,
   operationSchema,
   receiptSchema,
+  backingSchema,
   hex32,
   g1hex,
   sats,
@@ -11,6 +12,8 @@ import {
   psNullifier,
   psPreimageHash,
   decodePSToken,
+  psTokenAmount,
+  psInvoiceDetails,
 } from "@cashu/cashu-ts/tmp-cash";
 import type { TmpCashState } from "coco-cashu-core/tmp-cash";
 
@@ -62,6 +65,28 @@ const activity = z
     state: z.enum(["complete", "sent"]),
     token: z.string().max(262144).nullable(),
     receipt: receiptSchema.nullable(),
+    details: z
+      .object({
+        completedAt: date,
+        invoice: z.string().max(4096).nullable(),
+        quoteId: hex32.nullable(),
+        token: z.string().max(262144).nullable(),
+        backings: z
+          .array(
+            z
+              .object({
+                paymentHash: hex32,
+                backingAmount: sats,
+                amount: sats,
+                snapshot: backingSchema.nullable(),
+              })
+              .strict(),
+          )
+          .min(1)
+          .max(256),
+      })
+      .strict()
+      .optional(),
   })
   .strict();
 const stateSchema = z
@@ -130,6 +155,65 @@ export function validateTmpCashState(input: unknown): TmpCashState {
   for (const p of state.proofs)
     if (p.state !== "reserved" && p.operationId !== null)
       throw new Error("Backup reservation state is inconsistent");
-  for (const row of state.activity) if (row.token) decodePSToken(row.token);
+  for (const row of state.activity) {
+    if (row.token) decodePSToken(row.token);
+    if (
+      row.receipt &&
+      psPreimageHash(row.receipt.payout_preimage) !== row.receipt.payout_hash
+    )
+      throw new Error("Backup payment proof does not match its payment hash");
+    const details = row.details;
+    if (!details) continue;
+    if (
+      details.completedAt < row.createdAt ||
+      new Set(details.backings.map((b) => b.paymentHash)).size !==
+        details.backings.length
+    )
+      throw new Error("Backup activity details are inconsistent");
+    for (const backing of details.backings)
+      if (
+        backing.amount <= 0 ||
+        backing.amount > backing.backingAmount ||
+        (backing.snapshot &&
+          (backing.snapshot.payment_hash !== backing.paymentHash ||
+            backing.snapshot.amount !== backing.backingAmount))
+      )
+        throw new Error("Backup activity backing is inconsistent");
+    const token = details.token ?? row.token;
+    if (token) {
+      const decoded = decodePSToken(token);
+      const groups = new Map<
+        string,
+        { amount: number; backingAmount: number }
+      >();
+      for (const proof of decoded.proofs) {
+        const group = groups.get(proof.payment_hash) ?? {
+          amount: 0,
+          backingAmount: proof.backing_amount,
+        };
+        group.amount += proof.amount;
+        groups.set(proof.payment_hash, group);
+      }
+      if (
+        decoded.mint !== row.mint ||
+        (row.purpose !== "melt" && psTokenAmount(decoded) !== row.amount) ||
+        groups.size !== details.backings.length ||
+        details.backings.some(
+          (b) =>
+            groups.get(b.paymentHash)?.amount !== b.amount ||
+            groups.get(b.paymentHash)?.backingAmount !== b.backingAmount,
+        )
+      )
+        throw new Error("Backup activity token is inconsistent");
+    }
+    if (details.invoice) {
+      const invoice = psInvoiceDetails(details.invoice);
+      if (
+        invoice.amount !== row.amount ||
+        (row.receipt && invoice.paymentHash !== row.receipt.payout_hash)
+      )
+        throw new Error("Backup activity invoice is inconsistent");
+    }
+  }
   return state;
 }

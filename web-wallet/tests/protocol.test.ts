@@ -11,6 +11,7 @@ import {
   encodePSToken,
   decodePSToken,
   checkPSBacking,
+  psInvoiceDetails,
   type PSToken,
 } from "@cashu/cashu-ts/tmp-cash";
 import { TmpCashManager } from "coco-cashu-core/tmp-cash";
@@ -79,6 +80,126 @@ afterAll(async () => {
 });
 
 describe("Python mint ↔ browser cashu-ts protocol", () => {
+  it("persists complete deposit, transfer, and combined-payment history through encrypted backups", async () => {
+    const alice = new TmpCashManager(repository(), mintUrl);
+    const bobRepo = repository(),
+      bob = new TmpCashManager(bobRepo, mintUrl);
+    await alice.init();
+    await bob.init();
+    const funding = await alice.createFunding(100);
+    await control("accept", { payment_hash: funding.id });
+    const funded = await alice.pollFunding(funding.id);
+    const deposit = (await alice.view()).activity[0];
+    expect(deposit.details).toMatchObject({
+      invoice: funded.quote!.request,
+      quoteId: funded.quote!.quote,
+    });
+    expect(psTokenAmount(decodePSToken(deposit.details!.token!))).toBe(100);
+    const outgoing = await alice.send(30);
+    const sent = (await alice.view()).activity.find(
+      (a) => a.purpose === "send",
+    )!;
+    expect(sent.token).toBe(outgoing);
+    expect(sent.details!.backings).toMatchObject([
+      { paymentHash: funding.id, backingAmount: 100, amount: 30 },
+    ]);
+    await bob.receive(outgoing);
+    const received = (await bob.view()).activity.find(
+      (a) => a.purpose === "receive",
+    )!;
+    expect(received.details!.token).toBe(outgoing);
+    expect(received.details!.backings).toMatchObject([
+      { paymentHash: funding.id, amount: 30 },
+    ]);
+    const extra = await bob.createFunding(16);
+    await control("accept", { payment_hash: extra.id });
+    await bob.pollFunding(extra.id);
+    const { request } = await control("receiver", { amount: 40 });
+    const quote = await bob.meltQuote(request);
+    const receipt = await bob.melt(quote);
+    const state = await bobRepo.read(),
+      paid = state.activity.find((a) => a.purpose === "melt")!;
+    expect(paid.details).toMatchObject({
+      invoice: request,
+      quoteId: quote.quote,
+    });
+    expect(paid.details!.completedAt).toBeGreaterThanOrEqual(paid.createdAt);
+    expect(paid.details!.backings).toHaveLength(2);
+    expect(new Set(paid.details!.backings.map((b) => b.paymentHash))).toEqual(
+      new Set([funding.id, extra.id]),
+    );
+    expect(psPreimageHash(receipt.payout_preimage)).toBe(
+      psInvoiceDetails(request).paymentHash,
+    );
+    const password = "activity details backup passphrase";
+    const backup = await decryptBackup(
+      await encryptBackup(state, mintUrl, password),
+      password,
+    );
+    expect(backup.state.activity).toEqual(state.activity);
+    const restored = repository();
+    await restored.importState(backup.state);
+    expect((await restored.read()).activity).toEqual(state.activity);
+    const legacy = structuredClone(state);
+    for (const activity of legacy.activity) delete activity.details;
+    expect(
+      (
+        await decryptBackup(
+          await encryptBackup(legacy, mintUrl, password),
+          password,
+        )
+      ).state.activity,
+    ).toEqual(legacy.activity);
+    const tampered = structuredClone(state);
+    tampered.activity.find(
+      (a) => a.purpose === "melt",
+    )!.receipt!.payout_preimage = "00".repeat(32);
+    await expect(encryptBackup(tampered, mintUrl, password)).rejects.toThrow(
+      "payment proof",
+    );
+    const wrongBacking = structuredClone(state);
+    wrongBacking.activity.find(
+      (a) => a.purpose === "melt",
+    )!.details!.backings[0].amount = 1;
+    await expect(
+      encryptBackup(wrongBacking, mintUrl, password),
+    ).rejects.toThrow("activity token");
+  });
+
+  it("rejects an incorrect outgoing payment preimage before recording activity and recovers the real receipt on retry", async () => {
+    const repo = repository();
+    let corrupt = true;
+    const manager = new TmpCashManager(repo, mintUrl, async (input, init) => {
+      const response = await fetch(input, init);
+      if (corrupt && String(input).endsWith("/v1/melt/bolt11")) {
+        corrupt = false;
+        return new Response(
+          JSON.stringify({
+            ...(await response.json()),
+            payout_preimage: "00".repeat(32),
+          }),
+          { status: 200 },
+        );
+      }
+      return response;
+    });
+    await manager.init();
+    const funding = await manager.createFunding(32);
+    await control("accept", { payment_hash: funding.id });
+    await manager.pollFunding(funding.id);
+    const { request } = await control("receiver", { amount: 10 });
+    await expect(
+      manager.melt(await manager.meltQuote(request)),
+    ).rejects.toThrow("invalid melt receipt");
+    const state = await repo.read();
+    expect(state.activity.some((a) => a.purpose === "melt")).toBe(false);
+    expect(state.operations).toHaveLength(1);
+    const paid = await manager.retry(state.operations[0].id);
+    expect(paid.details!.invoice).toBe(request);
+    expect(psPreimageHash(paid.receipt!.payout_preimage)).toBe(
+      psInvoiceDetails(request).paymentHash,
+    );
+  });
   it("checks only supplied backing hashes and removes public enumeration", async () => {
     const selected = await mint(16),
       unrelated = await mint(32);
@@ -905,6 +1026,14 @@ describe("Coco operation journal and IndexedDB", () => {
       result = await restarted.retry(op.id);
     expect(result.receipt?.amount).toBe(98);
     expect(result.receipt?.change).toEqual([]);
+    expect(result.details).toMatchObject({
+      invoice: request,
+      quoteId: quote.quote,
+      backings: [{ paymentHash: funding.id, backingAmount: 100 }],
+    });
+    expect(psPreimageHash(result.receipt!.payout_preimage)).toBe(
+      psInvoiceDetails(request).paymentHash,
+    );
     expect(requests[0]).toBe(requests[1]);
     expect((await restarted.view()).balance).toBe(0);
     expect((await repo.read()).operations).toEqual([]);
