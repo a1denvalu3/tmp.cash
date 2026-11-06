@@ -477,6 +477,9 @@ export function App() {
         for (const f of state.fundings.filter(
           (f) => f.mint === mintUrl && f.state === "waiting",
         )) {
+          // Keep expired invoices available for manual checks and recovery.
+          if (f.quote && f.quote.expiry <= Math.floor(Date.now() / 1000))
+            continue;
           try {
             const result = await diagnoseAction("check-funding", () =>
               manager.pollFunding(f.id),
