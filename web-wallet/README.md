@@ -61,8 +61,10 @@ over HTTPS and use an HTTPS mint; browsers block mixed-content requests.
   The payer's wallet can continue to show a pending payment until settlement.
   The wallet shows only the newest invoice still awaiting payment. **Deposit
   invoice history** opens all invoices for the selected mint, newest first,
-  including funded and closed invoices. Select an entry to reopen it. Older
-  waiting invoices continue to be checked for payment in the background.
+  including funded and closed invoices. Select an entry to reopen it.
+  Waiting invoices are checked for payment in the background until their invoice
+  expiry. Expired invoices stay in history and can still be checked manually with
+  **Check payment**.
 - **Send:** picks one backing with enough value, privately splits its proofs,
   retains change, and saves the outgoing `cashuPS` token in Activity. Its preimage
   travels with the token. Sent proofs are excluded from the balance.

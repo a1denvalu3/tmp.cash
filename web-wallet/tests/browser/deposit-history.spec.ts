@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { psInvoiceDetails } from "@cashu/cashu-ts/tmp-cash";
+import { psInvoiceDetails, type PSQuote } from "@cashu/cashu-ts/tmp-cash";
 
 const mintUrl = "http://127.0.0.1:3339";
 
@@ -7,6 +7,79 @@ test.beforeEach(async ({ page }) => {
   await page.addInitScript((url) => {
     localStorage.setItem("layer3-mint", url);
   }, mintUrl);
+});
+
+test("stops automatic checks at invoice expiry, including after reload, and allows manual checks", async ({
+  page,
+}) => {
+  const quotes = new Map<number, PSQuote>();
+  const checks = new Map<string, number>();
+  await page.route(mintUrl + "/v1/mint/quote/bolt11", async (route) => {
+    const request = route.request().postDataJSON();
+    const response = await route.fetch({
+      postData: { ...request, expiry: request.amount === 10 ? 60 : 3600 },
+    });
+    const quote: PSQuote = await response.json();
+    quotes.set(quote.amount, quote);
+    await route.fulfill({ response });
+  });
+  await page.goto("/wallet/");
+  await expect(page.getByText("Mint connected", { exact: true })).toBeVisible();
+  for (const amount of [10, 100]) {
+    await page.getByRole("button", { name: "Add sats", exact: true }).click();
+    await page.getByLabel("Amount in sats").fill(String(amount));
+    await page.getByRole("button", { name: "Create funding invoice" }).click();
+    await expect(page.getByLabel("Funding invoice")).toHaveValue(/^lnbcrt/);
+    await page.getByRole("button", { name: "Close dialog" }).click();
+  }
+
+  const expiring = quotes.get(10)!;
+  const live = quotes.get(100)!;
+  await page.route(mintUrl + "/v1/mint/quote/bolt11/*", async (route) => {
+    const id = new URL(route.request().url()).pathname.split("/").pop()!;
+    checks.set(id, (checks.get(id) ?? 0) + 1);
+    if (id === expiring.quote)
+      await route.fulfill({
+        status: 503,
+        json: { detail: "Spark funding state unavailable; retry to reconcile" },
+      });
+    else await route.continue();
+  });
+
+  await page.clock.setFixedTime(new Date((expiring.expiry - 1) * 1000));
+  await expect.poll(() => checks.get(expiring.quote) ?? 0).toBeGreaterThan(0);
+  const expiredChecks = checks.get(expiring.quote)!;
+  const liveChecks = checks.get(live.quote) ?? 0;
+
+  // Polling must stop at the exact expiry, while newer invoices keep polling.
+  await page.clock.setFixedTime(new Date(expiring.expiry * 1000));
+  await expect
+    .poll(() => checks.get(live.quote) ?? 0, { timeout: 12000 })
+    .toBeGreaterThanOrEqual(liveChecks + 2);
+  expect(checks.get(expiring.quote)).toBe(expiredChecks);
+
+  await page.clock.setFixedTime(new Date((expiring.expiry + 1) * 1000));
+  await page.reload();
+  await expect(page.getByText("Mint connected", { exact: true })).toBeVisible();
+  const checksAfterReload = checks.get(live.quote) ?? 0;
+  await expect
+    .poll(() => checks.get(live.quote) ?? 0)
+    .toBeGreaterThan(checksAfterReload);
+  expect(checks.get(expiring.quote)).toBe(expiredChecks);
+
+  // Expiry only pauses automatic checks; keep recovery data and manual checks.
+  await page
+    .getByRole("button", { name: /Deposit invoice history \(/ })
+    .click();
+  await page.getByRole("button", { name: /^10 sats/ }).click();
+  await expect(page.getByLabel("Funding invoice")).toHaveValue(
+    expiring.request,
+  );
+  await page.getByRole("button", { name: "Check payment" }).click();
+  await expect(page.getByRole("alert")).toContainText(
+    "Spark funding state unavailable; retry to reconcile",
+  );
+  expect(checks.get(expiring.quote)).toBe(expiredChecks + 1);
 });
 
 test("shows only the latest waiting invoice and keeps the full deposit history", async ({
