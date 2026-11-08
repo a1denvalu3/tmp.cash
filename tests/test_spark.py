@@ -473,6 +473,62 @@ async def test_private_regtest_provider_has_its_own_cltv_policy(tmp_path):
     assert invoice.state == InvoiceState.accepted
 
 
+async def test_prune_retains_uncertain_expired_spark_invoice(spark, monkeypatch):
+    now = 1_800_000_000
+    monkeypatch.setattr(time, "time", lambda: now)
+    backend, sdk = spark
+    payment_hash = hashlib.sha256(os.urandom(32)).hexdigest()
+    invoice = await backend.create_hold_invoice(1000, payment_hash, 60)
+    assert invoice.state == InvoiceState.open
+    now += 61
+
+    with pytest.raises(BackendError, match="funding state unavailable"):
+        await backend.prune_invoice(payment_hash)
+    with backend.db.read() as conn:
+        assert conn.execute(
+            "SELECT 1 FROM invoices WHERE payment_hash=?", (payment_hash,)
+        ).fetchone()
+    assert payment_hash in sdk.invoices
+
+
+async def test_prune_retains_accepted_spark_invoice(spark, monkeypatch):
+    now = 1_800_000_000
+    monkeypatch.setattr(time, "time", lambda: now)
+    backend, _ = spark
+    _, payment_hash, payment = await held(spark, expiry=60)
+    payment.details.htlc_details.expiry_time = now + 3600
+    now += 61
+
+    assert (await backend.get_invoice(payment_hash)).state == InvoiceState.accepted
+    assert await backend.prune_invoice(payment_hash) is False
+    with backend.db.read() as conn:
+        assert conn.execute(
+            "SELECT 1 FROM invoices WHERE payment_hash=?", (payment_hash,)
+        ).fetchone()
+
+
+async def test_prune_deletes_terminal_unpaid_spark_invoice_idempotently(
+    spark, monkeypatch
+):
+    now = 1_800_000_000
+    monkeypatch.setattr(time, "time", lambda: now)
+    backend, _ = spark
+    _, payment_hash, payment = await held(spark, expiry=60)
+    payment.details.htlc_details.status = breez.SparkHtlcStatus.RETURNED
+    assert (await backend.get_invoice(payment_hash)).state == InvoiceState.canceled
+    now += 61
+
+    assert await backend.prune_invoice(payment_hash) is True
+    assert await backend.prune_invoice(payment_hash) is True
+    with backend.db.read() as conn:
+        assert (
+            conn.execute(
+                "SELECT 1 FROM invoices WHERE payment_hash=?", (payment_hash,)
+            ).fetchone()
+            is None
+        )
+
+
 async def test_invoice_creation_is_persistent_and_amount_bound(spark, tmp_path):
     backend, sdk = spark
     _, payment_hash, _ = await held(spark)

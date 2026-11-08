@@ -136,6 +136,7 @@ class Mint:
         self._hold_locks = _KeyedLocks()
         self._sync_work = asyncio.Semaphore(4)
         self._last_prune = 0.0
+        self._last_mint_prune = 0.0
         fingerprint = hmac.new(
             seed, b"Cashu_PS_Denominations_DB_v3", hashlib.sha256
         ).hexdigest()
@@ -1308,8 +1309,58 @@ class Mint:
                 (int(now),),
             )
 
+    async def _prune_mint_quotes(self):
+        """Prune expired unpaid mint quotes, at most every five minutes.
+
+        Backend uncertainty and every recovery-bearing state retain the quote.
+        """
+        now = time.time()
+        if now - self._last_mint_prune < 300:
+            return
+        self._last_mint_prune = now
+        eligible = (
+            "issued=0 AND expiry<=? AND redeemed=0 AND reserved=0 "
+            "AND preimage IS NULL AND closed=0 "
+            "AND digest IS NULL AND response IS NULL "
+            "AND NOT EXISTS (SELECT 1 FROM melt_inputs "
+            "WHERE melt_inputs.payment_hash=quotes.payment_hash)"
+        )
+        with self.db.read() as conn:
+            rows = conn.execute(
+                f"SELECT payment_hash FROM quotes WHERE {eligible}", (int(now),)
+            ).fetchall()
+        semaphore = asyncio.Semaphore(8)
+
+        async def prune(payment_hash: str):
+            async with semaphore:
+                async with self._hold_locks.hold(payment_hash):
+                    try:
+                        with self.db.read() as conn:
+                            row = conn.execute(
+                                f"SELECT 1 FROM quotes "
+                                f"WHERE payment_hash=? AND {eligible}",
+                                (payment_hash, int(now)),
+                            ).fetchone()
+                        if row is None or not await self.backend.prune_invoice(
+                            payment_hash
+                        ):
+                            return
+                        with self.db.transaction() as conn:
+                            conn.execute(
+                                f"DELETE FROM quotes "
+                                f"WHERE payment_hash=? AND {eligible}",
+                                (payment_hash, int(now)),
+                            )
+                    except Exception:
+                        # A missing or unreachable backend must not stop other rows;
+                        # cancellation (BaseException) still propagates.
+                        return
+
+        await asyncio.gather(*(prune(row[0]) for row in rows))
+
     async def resume_pending_melts(self):
         await self.reconcile_holds()
+        await self._prune_mint_quotes()
         self._prune_melt_quotes()
         with self.db.read() as conn:
             rows = conn.execute(

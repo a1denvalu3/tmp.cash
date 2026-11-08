@@ -174,6 +174,106 @@ async def test_lnd_hold_uses_supplied_hash_and_accepted_is_not_settled(tmp_path)
     await backend.close()
 
 
+@pytest.mark.asyncio
+async def test_lnd_prune_cancels_deletes_and_tolerates_lost_delete_response(tmp_path):
+    payment_hash = hashlib.sha256(PREIMAGE).hexdigest()
+    payment_request = FakeBackend._invoice(1000, payment_hash, 60, "tmp.cash hold")
+    state = "OPEN"
+    deleted = False
+    calls = []
+
+    def respond(request):
+        nonlocal state, deleted
+        calls.append((request.method, request.url.path))
+        if request.url.path == f"/v1/invoice/{payment_hash}":
+            if deleted:
+                return httpx.Response(404, json={})
+            return httpx.Response(
+                200,
+                json={
+                    "r_hash": base64.b64encode(bytes.fromhex(payment_hash)).decode(),
+                    "value": "1000",
+                    "payment_request": payment_request,
+                    "creation_date": str(int(time.time()) - 120),
+                    "expiry": "60",
+                    "state": state,
+                    "amt_paid_sat": "0",
+                },
+            )
+        if request.url.path == "/v2/invoices/cancel":
+            assert (
+                base64.b64decode(json.loads(request.content)["payment_hash"]).hex()
+                == payment_hash
+            )
+            state = "CANCELED"
+            return httpx.Response(200, json={})
+        if request.url.path == "/v1/invoices" and request.method == "DELETE":
+            assert request.url.params["invoice_hash"] == payment_hash
+            deleted = True
+            return httpx.Response(503, json={})
+        raise AssertionError(request.url)
+
+    macaroon = tmp_path / "admin.macaroon"
+    macaroon.write_bytes(b"test-only macaroon")
+    backend = LndRestBackend(
+        "https://lnd.test", macaroon, transport=httpx.MockTransport(respond)
+    )
+    with pytest.raises(BackendError, match="retried"):
+        await backend.prune_invoice(payment_hash)
+    assert await backend.prune_invoice(payment_hash) is True
+    assert calls == [
+        ("GET", f"/v1/invoice/{payment_hash}"),
+        ("POST", "/v2/invoices/cancel"),
+        ("GET", f"/v1/invoice/{payment_hash}"),
+        ("DELETE", "/v1/invoices"),
+        ("GET", f"/v1/invoice/{payment_hash}"),
+    ]
+    await backend.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "state,paid,expired",
+    [
+        ("OPEN", "0", False),
+        ("ACCEPTED", "1000", True),
+        ("CANCELED", "1000", True),
+        ("SETTLED", "1000", True),
+    ],
+)
+async def test_lnd_prune_retains_live_paid_and_accepted_invoices(
+    tmp_path, state, paid, expired
+):
+    payment_hash = hashlib.sha256(PREIMAGE).hexdigest()
+    payment_request = FakeBackend._invoice(1000, payment_hash, 60, "tmp.cash hold")
+    calls = []
+
+    def respond(request):
+        calls.append((request.method, request.url.path))
+        assert request.url.path == f"/v1/invoice/{payment_hash}"
+        return httpx.Response(
+            200,
+            json={
+                "r_hash": base64.b64encode(bytes.fromhex(payment_hash)).decode(),
+                "value": "1000",
+                "payment_request": payment_request,
+                "creation_date": str(int(time.time()) - (120 if expired else 0)),
+                "expiry": "60",
+                "state": state,
+                "amt_paid_sat": paid,
+            },
+        )
+
+    macaroon = tmp_path / "admin.macaroon"
+    macaroon.write_bytes(b"test-only macaroon")
+    backend = LndRestBackend(
+        "https://lnd.test", macaroon, transport=httpx.MockTransport(respond)
+    )
+    assert await backend.prune_invoice(payment_hash) is False
+    assert calls == [("GET", f"/v1/invoice/{payment_hash}")]
+    await backend.close()
+
+
 def tracked_stream(*updates):
     return "\n".join(
         update if isinstance(update, str) else json.dumps(update) for update in updates

@@ -176,6 +176,13 @@ settlement margin is 6 blocks before cancellation. The fake backend uses a
 Choose margins for your node's operating conditions. The background worker
 runs every 5 seconds; it cannot settle through a node outage or while stopped.
 
+Every five minutes, recovery also prunes expired mint quotes only after the
+backend confirms that no recoverable payment remains and removes the backing
+invoice. Accepted, issued, live, and recovery-bearing quotes are retained. Spark payment
+history cannot prove that an expired invoice is unpaid when its receive record
+is unavailable, so those uncertain invoices and their mint quotes are retained;
+operators must continue to monitor storage growth for that case.
+
 ### Local LND regtest with the web wallet
 
 Use the existing funded `~/cashu-regtest` network. `lnd-1` pays the backing hold,
