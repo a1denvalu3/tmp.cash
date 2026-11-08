@@ -384,7 +384,7 @@ export function LandingPage() {
                 <span /> tmp.cash / EXPLAINED
               </span>
               <h1 id="hero-title">
-                Digital cash,
+                Private digital cash.
                 <br />
                 <span>No custodian</span>
               </h1>
