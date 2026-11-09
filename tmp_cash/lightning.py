@@ -15,6 +15,7 @@ import httpx
 from bolt11 import Bolt11, MilliSatoshi, Tag, TagChar, Tags, decode, encode
 from pydantic import BaseModel, ConfigDict, Field
 
+from .concurrency import run_blocking
 from .crud import FAKE
 from .db import BackendError, Database
 from .models import InvoiceState, OperatorFundingRequest, OperatorFundingResponse
@@ -164,7 +165,8 @@ class FakeBackend(HoldInvoiceBackend):
         self, amount: int, expiry: int = 3600
     ) -> OperatorFundingResponse:
         parameters = OperatorFundingRequest(amount=amount, expiry=expiry)
-        request = self.receiver_invoice(
+        request = await run_blocking(
+            self.receiver_invoice,
             parameters.amount,
             os.urandom(32),
             expiry=parameters.expiry,
@@ -182,6 +184,10 @@ class FakeBackend(HoldInvoiceBackend):
     async def create_hold_invoice(
         self, amount: int, payment_hash: str, expiry: int
     ) -> Invoice:
+        await run_blocking(self._create_hold_invoice, amount, payment_hash, expiry)
+        return await self.get_invoice(payment_hash)
+
+    def _create_hold_invoice(self, amount, payment_hash, expiry):
         with self.db.transaction() as conn:
             row = conn.get("invoices", columns=("amount",), payment_hash=payment_hash)
             if row is not None and row["amount"] != amount:
@@ -198,11 +204,18 @@ class FakeBackend(HoldInvoiceBackend):
                         "state": InvoiceState.open.value,
                         "amount_paid": 0,
                     },
+                    ignore=True,
                 )
-        return await self.get_invoice(payment_hash)
+                row = conn.get(
+                    "invoices", columns=("amount",), payment_hash=payment_hash
+                )
+                if row is None or row["amount"] != amount:
+                    raise BackendError(
+                        "payment hash already has another invoice amount"
+                    )
 
     async def get_invoice(self, payment_hash: str) -> Invoice:
-        with self.db.transaction() as conn:
+        def lookup(conn):
             conn.fake_expire_invoice(
                 payment_hash,
                 int(time.time()),
@@ -213,6 +226,9 @@ class FakeBackend(HoldInvoiceBackend):
                 # stay closed, including invoices expired by the query above.
                 conn.fake_accept_open_invoice(payment_hash, int(time.time()))
             row = conn.get("invoices", payment_hash=payment_hash)
+            return row
+
+        row = await self.db.run_transaction(lookup)
         if row is None:
             raise BackendError("unknown hold invoice")
         return Invoice(
@@ -234,25 +250,35 @@ class FakeBackend(HoldInvoiceBackend):
         invoice = await self.get_invoice(payment_hash)
         if invoice.state != InvoiceState.open:
             raise BackendError("invoice is not open")
-        with self.db.transaction() as conn:
-            conn.fake_accept_open_invoice(payment_hash, int(time.time()))
+        updated = await self.db.run_transaction(
+            lambda conn: conn.fake_accept_open_invoice(payment_hash, int(time.time()))
+        )
+        if updated.rowcount != 1:
+            raise BackendError("invoice is not open")
 
     async def cancel(self, payment_hash: str) -> None:
         invoice = await self.get_invoice(payment_hash)
         if invoice.state == InvoiceState.settled:
             raise BackendError("invoice already settled")
-        with self.db.transaction() as conn:
+
+        def cancel(conn):
+            row = conn.get("invoices", payment_hash=payment_hash, for_update=True)
+            if row["state"] == InvoiceState.settled.value:
+                raise BackendError("invoice already settled")
             conn.update(
                 "invoices",
                 {"state": InvoiceState.canceled.value},
                 payment_hash=payment_hash,
             )
 
+        await self.db.run_transaction(cancel)
+
     async def prune_invoice(self, payment_hash: str) -> bool:
-        with self.db.read() as conn:
-            row = conn.get(
+        row = await self.db.run_read(
+            lambda conn: conn.get(
                 "invoices", columns=("payment_hash",), payment_hash=payment_hash
             )
+        )
         if row is None:
             return True
         invoice = await self.get_invoice(payment_hash)
@@ -263,8 +289,9 @@ class FakeBackend(HoldInvoiceBackend):
             or invoice.expiry > now
         ):
             return False
-        with self.db.transaction() as conn:
-            deleted = conn.fake_prune_invoice(payment_hash, now)
+        deleted = await self.db.run_transaction(
+            lambda conn: conn.fake_prune_invoice(payment_hash, now)
+        )
         return deleted.rowcount == 1
 
     def receiver_invoice(
@@ -298,12 +325,20 @@ class FakeBackend(HoldInvoiceBackend):
             return
         if invoice.state != InvoiceState.accepted:
             raise BackendError("hold invoice is not accepted")
-        with self.db.transaction() as conn:
+
+        def settle(conn):
+            row = conn.get("invoices", payment_hash=payment_hash, for_update=True)
+            if row["state"] == InvoiceState.settled.value:
+                return
+            if row["state"] != InvoiceState.accepted.value:
+                raise BackendError("hold invoice is not accepted")
             conn.update(
                 "invoices",
                 {"state": InvoiceState.settled.value},
                 payment_hash=payment_hash,
             )
+
+        await self.db.run_transaction(settle)
 
     async def pay_invoice(
         self,
@@ -313,6 +348,9 @@ class FakeBackend(HoldInvoiceBackend):
         cltv_limit: int | None = None,
         idempotency_key: str | None = None,
     ) -> Payment:
+        return await run_blocking(self._pay_invoice, request, fee_limit_sat)
+
+    def _pay_invoice(self, request: str, fee_limit_sat: int | None) -> Payment:
         payment_hash, _ = invoice_details(request)
         with self.db.transaction() as conn:
             previous = conn.get("payments", payment_hash=payment_hash)
@@ -341,12 +379,19 @@ class FakeBackend(HoldInvoiceBackend):
                     "preimage": preimage,
                     "fee_msat": self.fee_msat,
                 },
+                ignore=True,
             )
-        return Payment(PaymentState.succeeded, preimage, self.fee_msat)
+            stored = conn.get("payments", payment_hash=payment_hash)
+            if stored is None:
+                raise BackendError("fake payment disappeared during persistence")
+        return Payment(
+            PaymentState(stored["state"]), stored["preimage"], stored["fee_msat"]
+        )
 
     async def get_payment(self, payment_hash: str) -> Payment | None:
-        with self.db.read() as conn:
-            row = conn.get("payments", payment_hash=payment_hash)
+        row = await self.db.run_read(
+            lambda conn: conn.get("payments", payment_hash=payment_hash)
+        )
         if row is None:
             return None
         return Payment(PaymentState(row["state"]), row["preimage"], row["fee_msat"])

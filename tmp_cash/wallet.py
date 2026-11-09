@@ -39,10 +39,36 @@ class Wallet:
     def save_many(self, operations: list[Operation]):
         """Persist every recovery request before starting a multi-backing receive."""
         with self.db.transaction() as conn:
-            for operation in operations:
+            conn.lock_keys("operation", [operation.id for operation in operations])
+            conn.lock_keys(
+                "mint-quote",
+                [
+                    operation.quote.quote
+                    for operation in operations
+                    if isinstance(operation, MintOperation)
+                ],
+            )
+            # Lock imported proofs in a consistent order across the full batch.
+            sources = sorted(
+                {
+                    Client.nullifier(proof)
+                    for operation in operations
+                    if not isinstance(operation, MintOperation)
+                    for proof in operation.token.proofs
+                }
+            )
+            conn.lock_keys("token", sources)
+            for operation in sorted(operations, key=lambda operation: operation.id):
                 self._save(conn, operation)
 
     def _save(self, conn, operation: Operation, send_amount: int | None = None):
+        conn.lock_keys("operation", [operation.id])
+        if isinstance(operation, MintOperation):
+            conn.lock_keys("mint-quote", [operation.quote.quote])
+        else:
+            conn.lock_keys(
+                "token", [Client.nullifier(proof) for proof in operation.token.proofs]
+            )
         if send_amount is not None and (
             not isinstance(operation, SwapOperation)
             or not 0 < send_amount <= operation.token.amount
@@ -54,7 +80,10 @@ class Wallet:
         ):
             raise ValueError("invalid split-send operation")
         previous = conn.get(
-            "operations", columns=("payload", "send_amount"), id=operation.id
+            "operations",
+            columns=("payload", "send_amount"),
+            id=operation.id,
+            for_update=True,
         )
         if previous:
             if previous[0] != operation.model_dump_json() or previous[1] != send_amount:
@@ -79,9 +108,9 @@ class Wallet:
             },
         )
         if operation.kind != "mint":
-            for proof in operation.token.proofs:
+            for proof in sorted(operation.token.proofs, key=Client.nullifier):
                 source = Client.nullifier(proof)
-                row = conn.get("tokens", columns=("state",), id=source)
+                row = conn.get("tokens", columns=("state",), id=source, for_update=True)
                 allowed = {"LIVE", "SENT"} if operation.kind == "swap" else {"LIVE"}
                 if row is not None and row[0] not in allowed:
                     raise ValueError(
@@ -157,8 +186,9 @@ class Wallet:
 
     def complete(self, operation_id: str, token: Token | None) -> Token | None:
         with self.db.transaction() as conn:
+            conn.lock_keys("operation", [operation_id])
             operation = conn.get(
-                "operations", columns=("send_amount",), id=operation_id
+                "operations", columns=("send_amount",), id=operation_id, for_update=True
             )
             if operation is None:
                 raise ValueError("unknown pending operation")
@@ -268,7 +298,10 @@ class Wallet:
     def _expire_operation(self, operation_id: str):
         """Clear a terminally failed melt and mark its inputs locally expired."""
         with self.db.transaction() as conn:
-            operation = conn.get("operations", columns=("kind",), id=operation_id)
+            conn.lock_keys("operation", [operation_id])
+            operation = conn.get(
+                "operations", columns=("kind",), id=operation_id, for_update=True
+            )
             if operation is None:
                 raise ValueError("unknown pending operation")
             if operation["kind"] != "melt":
@@ -291,8 +324,12 @@ class Wallet:
 
     def _release_operation(self, operation_id: str, require_unsubmitted: bool = False):
         with self.db.transaction() as conn:
+            conn.lock_keys("operation", [operation_id])
             operation = conn.get(
-                "operations", columns=("kind", "attempted"), id=operation_id
+                "operations",
+                columns=("kind", "attempted"),
+                id=operation_id,
+                for_update=True,
             )
             if operation is None:
                 raise ValueError("unknown pending operation")

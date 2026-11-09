@@ -7,13 +7,13 @@ import os
 import time
 import uuid
 from collections import OrderedDict
-from collections.abc import AsyncIterator, Hashable, Iterable, Sequence
-from contextlib import AsyncExitStack, asynccontextmanager
+from collections.abc import Iterable, Sequence
 from pathlib import Path
 
 from bolt11 import decode
 from sqlalchemy.exc import IntegrityError
 
+from .concurrency import KeyedLocks, run_blocking
 from .crud import MINT
 from .crypto.bls import PublicKey
 from .crypto.ps import (
@@ -69,44 +69,6 @@ def request_digest(request) -> str:
 SCHEMA_VERSION = 2
 
 
-class _KeyedLocks:
-    """Reference-counted asyncio locks; idle entries are evicted."""
-
-    def __init__(self) -> None:
-        self._entries: dict[Hashable, list] = {}
-        self._mutex = asyncio.Lock()
-
-    @asynccontextmanager
-    async def hold(self, key: Hashable) -> AsyncIterator[None]:
-        async with self._mutex:
-            entry = self._entries.setdefault(key, [asyncio.Lock(), 0])
-            entry[1] += 1
-        try:
-            await entry[0].acquire()
-        except BaseException:
-            # A cancelled waiter must not leak its reference count.
-            await self._drop(key, entry)
-            raise
-        try:
-            yield
-        finally:
-            entry[0].release()
-            await self._drop(key, entry)
-
-    async def _drop(self, key: Hashable, entry: list) -> None:
-        async with self._mutex:
-            entry[1] -= 1
-            if entry[1] == 0:
-                self._entries.pop(key, None)
-
-    @asynccontextmanager
-    async def hold_many(self, keys: Iterable[str]) -> AsyncIterator[None]:
-        async with AsyncExitStack() as stack:
-            for key in sorted(set(keys)):
-                await stack.enter_async_context(self.hold(key))
-            yield
-
-
 class Mint:
     def __init__(
         self,
@@ -127,8 +89,8 @@ class Mint:
         self.settle_margin_seconds = settle_margin_seconds
         self.fee_limit_sat = getattr(backend, "fee_limit_sat", 10)
         self.keys = Keyset(seed)
-        self._melt_locks = _KeyedLocks()
-        self._hold_locks = _KeyedLocks()
+        self._melt_locks = KeyedLocks()
+        self._hold_locks = KeyedLocks()
         self._sync_work = asyncio.Semaphore(4)
         self._last_prune = 0.0
         self._last_mint_prune = 0.0
@@ -192,8 +154,7 @@ class Mint:
                 "mint is busy with cryptographic work; retry the request", 503
             ) from None
         try:
-            loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(None, operation, *args)
+            return await run_blocking(operation, *args)
         finally:
             self._sync_work.release()
 
@@ -303,8 +264,7 @@ class Mint:
 
     async def check_htlcs(self, request: HTLCCheckRequest) -> PendingHTLCsResponse:
         hashes = list(dict.fromkeys(request.payment_hashes))
-        with self.db.read() as conn:
-            rows = conn.mint_htlc_quotes(hashes)
+        rows = await self.db.run_read(lambda conn: conn.mint_htlc_quotes(hashes))
         height = await self.backend.get_block_height()
         semaphore = asyncio.Semaphore(8)
 
@@ -316,8 +276,7 @@ class Mint:
 
         invoices = await asyncio.gather(*(lookup(row) for row in rows))
         now = int(time.time())
-        with self.db.read() as conn:
-            closed = conn.mint_closed_hashes(hashes)
+        closed = await self.db.run_read(lambda conn: conn.mint_closed_hashes(hashes))
         entries = []
         for invoice in invoices:
             if invoice.state == InvoiceState.open or (
@@ -356,12 +315,11 @@ class Mint:
 
     async def quote(self, request: QuoteRequest) -> QuoteResponse:
         h = htlc_claim_scalar(request.payment_hash, request.amount)
-        with self.db.read() as conn:
-            existing = conn.get(
-                "quotes",
-                columns=("quote", "amount"),
-                payment_hash=request.payment_hash,
+        existing = await self.db.run_read(
+            lambda conn: conn.get(
+                "quotes", columns=("quote", "amount"), payment_hash=request.payment_hash
             )
+        )
         if existing:
             if existing["amount"] != request.amount:
                 raise MintError("payment hash already has a different amount", 409)
@@ -372,8 +330,8 @@ class Mint:
         self._validate_invoice(invoice, request.payment_hash, request.amount)
         quote_id = os.urandom(32).hex()
         try:
-            with self.db.transaction() as conn:
-                conn.insert(
+            await self.db.run_transaction(
+                lambda conn: conn.insert(
                     "quotes",
                     {
                         "quote": quote_id,
@@ -384,21 +342,22 @@ class Mint:
                         "expiry": invoice.expiry,
                     },
                 )
+            )
         except IntegrityError:
-            with self.db.read() as conn:
-                existing = conn.get(
+            existing = await self.db.run_read(
+                lambda conn: conn.get(
                     "quotes",
                     columns=("quote", "amount"),
                     payment_hash=request.payment_hash,
                 )
+            )
             if existing is None or existing["amount"] != request.amount:
                 raise MintError("payment hash or HTLC claim already used", 409)
             quote_id = existing["quote"]
         return await self.get_quote(quote_id)
 
     async def get_quote(self, quote_id: str) -> QuoteResponse:
-        with self.db.read() as conn:
-            row = conn.get("quotes", quote=quote_id)
+        row = await self.db.run_read(lambda conn: conn.get("quotes", quote=quote_id))
         if row is None:
             raise MintError("unknown mint quote", 404)
         invoice = await self.backend.get_invoice(row["payment_hash"])
@@ -448,13 +407,15 @@ class Mint:
     async def mint(self, request: MintRequest) -> SignaturesResponse:
         await self._run_sync(self._validate_outputs, request)
         digest = request_digest(request)
-        with self.db.read() as conn:
-            row = conn.get("quotes", quote=request.quote)
+        row = await self.db.run_read(
+            lambda conn: conn.get("quotes", quote=request.quote)
+        )
         if row is None:
             raise MintError("unknown mint quote", 404)
         async with self._hold_locks.hold(row["payment_hash"]):
-            with self.db.read() as conn:
-                row = conn.get("quotes", quote=request.quote)
+            row = await self.db.run_read(
+                lambda conn: conn.get("quotes", quote=request.quote)
+            )
             if row is None:
                 raise MintError("unknown mint quote", 404)
             if row["issued"]:
@@ -517,40 +478,53 @@ class Mint:
         ):
             raise MintError("invalid common HTLC equality proof")
         digest = request_digest(request)
-        with self.db.transaction() as conn:
-            rows = conn.select("nullifiers", in_={"nullifier": nullifiers})
-            if rows:
-                if all(
-                    row["kind"] == "swap" and row["digest"] == digest for row in rows
-                ):
-                    return SignaturesResponse.model_validate_json(rows[0]["response"])
-                raise MintError("input token is already spent or reserved", 409)
-            signatures = []
-            for output, owner, b in zip(request.outputs, owners, commitments):
-                u, v = issue_blind(self._key(output.amount), b, owner)
-                signatures.append(
-                    SignatureResponse(
-                        amount=output.amount,
-                        keyset_id=self.keys.id,
-                        u=u.format().hex(),
-                        v=v.format().hex(),
-                    )
+        # Signing depends only on the validated request. Keep it outside the
+        # write transaction so unrelated writers do not wait for cryptography.
+        signatures = []
+        for output, owner, b in zip(request.outputs, owners, commitments):
+            u, v = issue_blind(self._key(output.amount), b, owner)
+            signatures.append(
+                SignatureResponse(
+                    amount=output.amount,
+                    keyset_id=self.keys.id,
+                    u=u.format().hex(),
+                    v=v.format().hex(),
                 )
-            response = SignaturesResponse(signatures=signatures)
-            conn.insert_many(
-                "nullifiers",
-                [
-                    {
-                        "nullifier": nullifier,
-                        "state": "SPENT",
-                        "kind": "swap",
-                        "digest": digest,
-                        "response": response.model_dump_json(),
-                    }
-                    for nullifier in nullifiers
-                ],
             )
+        response = SignaturesResponse(signatures=signatures)
+        try:
+            with self.db.transaction() as conn:
+                rows = conn.select("nullifiers", in_={"nullifier": nullifiers})
+                if rows:
+                    return self._existing_swap(rows, nullifiers, digest)
+                # Unique nullifiers arbitrate concurrent spends, including
+                # races where neither transaction initially found a row.
+                conn.insert_many(
+                    "nullifiers",
+                    [
+                        {
+                            "nullifier": nullifier,
+                            "state": "SPENT",
+                            "kind": "swap",
+                            "digest": digest,
+                            "response": response.model_dump_json(),
+                        }
+                        for nullifier in sorted(nullifiers)
+                    ],
+                )
+        except IntegrityError:
+            with self.db.read() as conn:
+                rows = conn.select("nullifiers", in_={"nullifier": nullifiers})
+            return self._existing_swap(rows, nullifiers, digest)
         return response
+
+    @staticmethod
+    def _existing_swap(rows, nullifiers, digest):
+        if len(rows) == len(nullifiers) and all(
+            row["kind"] == "swap" and row["digest"] == digest for row in rows
+        ):
+            return SignaturesResponse.model_validate_json(rows[0]["response"])
+        raise MintError("input token is already spent or reserved", 409)
 
     async def check(self, nullifiers: list[str]) -> CheckResponse:
         return await self._run_sync(self._check, nullifiers)
@@ -584,11 +558,12 @@ class Mint:
             fee_reserve=fee,
             expiry=expiry,
         )
-        with self.db.transaction() as conn:
-            conn.insert(
+        await self.db.run_transaction(
+            lambda conn: conn.insert(
                 "melt_quotes",
                 {"quote": response.quote, "payload": response.model_dump_json()},
             )
+        )
         return response
 
     def _melt_quote(self, quote_id: str) -> MeltQuoteResponse:
@@ -659,14 +634,17 @@ class Mint:
         return nullifiers, groups
 
     async def melt(self, request: MeltRequest) -> MeltResponse:
-        quote = self._melt_quote(request.quote)
+        quote = await run_blocking(self._melt_quote, request.quote)
         digest = request_digest(request)
         async with self._melt_locks.hold(quote.quote):
-            with self.db.read() as conn:
-                previous = conn.get("melts", quote=quote.quote)
-                failed = conn.get(
-                    "failed_melts", columns=("digest", "expired"), quote=quote.quote
+            previous, failed = await self.db.run_read(
+                lambda conn: (
+                    conn.get("melts", quote=quote.quote),
+                    conn.get(
+                        "failed_melts", columns=("digest", "expired"), quote=quote.quote
+                    ),
                 )
+            )
             if failed is not None:
                 if failed["digest"] != digest:
                     raise MintError(
@@ -682,7 +660,9 @@ class Mint:
                     )
                 if previous["state"] == "PAID":
                     return MeltResponse.model_validate_json(previous["response"])
-                if previous["melt_lock"] or not self._claim_melt(previous):
+                if previous["melt_lock"] or not await run_blocking(
+                    self._claim_melt, previous
+                ):
                     # An executor owns this payment attempt; pollers must not
                     # consult backend status or release inputs behind its back.
                     raise MintError(
@@ -705,13 +685,14 @@ class Mint:
             # Hold the involved backing locks in sorted order so reconciliation
             # cannot close or settle a hold underneath this reservation.
             async with self._hold_locks.hold_many(groups):
-                with self.db.read() as conn:
-                    rows = {
+                rows = await self.db.run_read(
+                    lambda conn: {
                         payment_hash: conn.get(
                             "quotes", payment_hash=payment_hash, issued=1
                         )
                         for payment_hash in groups
                     }
+                )
                 height = await self.backend.get_block_height()
                 for payment_hash, row in rows.items():
                     if (
@@ -730,67 +711,74 @@ class Mint:
                 # reservation: the attempt owns these inputs from this point.
                 attempt = uuid.uuid4().hex
                 try:
-                    with self.db.transaction() as conn:
-                        if conn.select("nullifiers", in_={"nullifier": nullifiers}):
-                            raise MintError(
-                                "input token is already spent or reserved", 409
-                            )
-                        conn.insert(
-                            "melts",
-                            {
-                                "quote": quote.quote,
-                                "payout_hash": quote.payment_hash,
-                                "request": request.model_dump_json(),
-                                "digest": digest,
-                                "state": "PENDING",
-                                "response": None,
-                                "attempt": attempt,
-                                "melt_lock": attempt,
-                                "submitted": 0,
-                            },
-                        )
-                        conn.insert_many(
-                            "nullifiers",
-                            [
-                                {
-                                    "nullifier": nullifier,
-                                    "state": "PENDING",
-                                    "kind": "melt",
-                                    "digest": digest,
-                                    "response": None,
-                                }
-                                for nullifier in nullifiers
-                            ],
-                        )
-                        for payment_hash, group in groups.items():
-                            updated = conn.mint_reserve_backing(
-                                payment_hash, group["amount"], group["preimage"]
-                            )
-                            if updated.rowcount != 1:
-                                raise MintError(
-                                    "backing HTLC value is exhausted or reserved", 409
-                                )
-                            conn.insert(
-                                "melt_inputs",
-                                {
-                                    "melt": quote.quote,
-                                    "payment_hash": payment_hash,
-                                    "amount": group["amount"],
-                                },
-                            )
+                    await run_blocking(
+                        self._reserve_melt,
+                        quote,
+                        request,
+                        digest,
+                        attempt,
+                        nullifiers,
+                        groups,
+                    )
                 except IntegrityError as exc:
-                    with self.db.read() as conn:
-                        occupied = conn.get(
-                            "melts",
-                            columns=("state",),
-                            payout_hash=quote.payment_hash,
+                    occupied = await self.db.run_read(
+                        lambda conn: conn.get(
+                            "melts", columns=("state",), payout_hash=quote.payment_hash
                         )
+                    )
                     if occupied is not None and occupied["state"] == "PAID":
                         raise MintError("payout invoice is already paid", 409) from exc
                     raise MintError(
                         "payout invoice is already reserved or paid", 409
                     ) from exc
             return await self._execute_melt(request, quote, digest, attempt, False)
+
+    def _reserve_melt(self, quote, request, digest, attempt, nullifiers, groups):
+        with self.db.transaction() as conn:
+            if conn.select("nullifiers", in_={"nullifier": nullifiers}):
+                raise MintError("input token is already spent or reserved", 409)
+            conn.insert(
+                "melts",
+                {
+                    "quote": quote.quote,
+                    "payout_hash": quote.payment_hash,
+                    "request": request.model_dump_json(),
+                    "digest": digest,
+                    "state": "PENDING",
+                    "response": None,
+                    "attempt": attempt,
+                    "melt_lock": attempt,
+                    "submitted": 0,
+                },
+            )
+            conn.insert_many(
+                "nullifiers",
+                [
+                    {
+                        "nullifier": nullifier,
+                        "state": "PENDING",
+                        "kind": "melt",
+                        "digest": digest,
+                        "response": None,
+                    }
+                    for nullifier in sorted(nullifiers)
+                ],
+            )
+            for payment_hash in sorted(groups):
+                group = groups[payment_hash]
+                updated = conn.mint_reserve_backing(
+                    payment_hash, group["amount"], group["preimage"]
+                )
+                if updated.rowcount != 1:
+                    raise MintError("backing HTLC value is exhausted or reserved", 409)
+                conn.insert(
+                    "melt_inputs",
+                    {
+                        "melt": quote.quote,
+                        "payment_hash": payment_hash,
+                        "amount": group["amount"],
+                    },
+                )
 
     def _within_melt_lockout(self, invoice: Invoice, height: int | None) -> bool:
         """Conservative submission lockout: twice the settlement margin."""
@@ -831,8 +819,9 @@ class Mint:
                     # A FAILED record seen before the first submission can only
                     # come from an older quote for the same payout invoice; the
                     # new attempt may still send (the backend deduplicates).
-                    with self.db.read() as conn:
-                        rows = conn.mint_melt_backings(quote.quote)
+                    rows = await self.db.run_read(
+                        lambda conn: conn.mint_melt_backings(quote.quote)
+                    )
                     try:
                         height = await self.backend.get_block_height()
                         cltv_limit = None
@@ -865,17 +854,20 @@ class Mint:
                             raise MintError("melt quote has expired", 409)
                     except MintError:
                         # Never submitted: the reservation can safely be released.
-                        self._release_melt(quote.quote, digest, attempt)
+                        await run_blocking(
+                            self._release_melt, quote.quote, digest, attempt
+                        )
                         raise
-                    with self.db.transaction() as conn:
-                        updated = conn.mint_mark_submitted(quote.quote, attempt)
-                        if updated.rowcount != 1:
-                            raise BackendError("melt outbox changed before submission")
+                    updated = await self.db.run_transaction(
+                        lambda conn: conn.mint_mark_submitted(quote.quote, attempt)
+                    )
+                    if updated.rowcount != 1:
+                        raise BackendError("melt outbox changed before submission")
             except BackendError:
                 # Nothing was submitted yet, so the failure is not uncertain:
                 # unlock the outbox and let a later retry submit it. Fail-closed
                 # locking applies only once the send becomes uncertain (below).
-                self._unlock_melt(quote.quote, attempt)
+                await run_blocking(self._unlock_melt, quote.quote, attempt)
                 raise
             if payment is None or payment.state == PaymentState.failed:
                 # Retries of this outbox reuse the same attempt-derived key, so
@@ -904,7 +896,7 @@ class Mint:
                 # again, and never release merely because expiry moved.
                 payment = Payment(PaymentState.pending)
         if payment.state == PaymentState.pending:
-            self._unlock_melt(quote.quote, attempt)
+            await run_blocking(self._unlock_melt, quote.quote, attempt)
             raise MintError("melt payment is pending; retry the same request", 409)
         if payment.state == PaymentState.failed:
             if await self._fail_melt(quote.quote, digest, attempt):
@@ -934,7 +926,7 @@ class Mint:
             # The payout succeeded externally but signing admission is busy:
             # leave the durable outbox unlocked for recovery; never convert a
             # paid external payout into a failure or release.
-            self._unlock_melt(quote.quote, attempt)
+            await run_blocking(self._unlock_melt, quote.quote, attempt)
             raise MintError(
                 "melt payment is pending; retry the same request", 409
             ) from None
@@ -959,7 +951,7 @@ class Mint:
         expired_change = 0
         hashes = list(dict.fromkeys(preimage_hash(p.preimage) for p in request.inputs))
         with self.db.transaction() as conn:
-            previous = conn.get("melts", quote=quote.quote)
+            previous = conn.get("melts", quote=quote.quote, for_update=True)
             if previous is None:
                 raise BackendError("melt outbox disappeared during finalization")
             if previous["state"] == "PAID":
@@ -972,6 +964,13 @@ class Mint:
                 or previous["melt_lock"] != attempt
             ):
                 raise BackendError("melt outbox is owned by another attempt")
+            conn.select(
+                "quotes",
+                columns=("payment_hash",),
+                in_={"payment_hash": hashes},
+                order_by="payment_hash",
+                for_update=True,
+            )
             for payment_hash in hashes:
                 entry = conn.mint_melt_input(quote.quote, payment_hash)
                 if entry is None:
@@ -1029,13 +1028,14 @@ class Mint:
         payout is already definitively failed) for a later retry instead of
         falsely reporting an ordinary unspent failure.
         """
-        with self.db.read() as conn:
-            hashes = [
+        hashes = await self.db.run_read(
+            lambda conn: [
                 row[0]
                 for row in conn.select(
                     "melt_inputs", columns=("payment_hash",), melt=quote_id
                 )
             ]
+        )
         async with self._hold_locks.hold_many(hashes):
             unavailable = False
             for payment_hash in hashes:
@@ -1044,21 +1044,25 @@ class Mint:
                 except Exception:
                     unavailable = True
             if unavailable:
-                self._unlock_melt(quote_id, attempt)
+                await run_blocking(self._unlock_melt, quote_id, attempt)
                 raise BackendError(
                     "backing liveness unavailable; retry to finish the failed melt"
                 )
-            with self.db.read() as conn:
-
-                def is_closed(payment_hash: str) -> bool:
-                    row = conn.get(
-                        "quotes", columns=("closed",), payment_hash=payment_hash
+            expired = await self.db.run_read(
+                lambda conn: any(
+                    row["closed"]
+                    for row in conn.select(
+                        "quotes", columns=("closed",), in_={"payment_hash": hashes}
                     )
-                    return row is not None and bool(row["closed"])
-
-                expired = any(is_closed(payment_hash) for payment_hash in hashes)
-            self._release_melt(
-                quote_id, digest, attempt, payment_failed=True, expired=expired
+                )
+            )
+            await run_blocking(
+                self._release_melt,
+                quote_id,
+                digest,
+                attempt,
+                payment_failed=True,
+                expired=expired,
             )
             return expired
 
@@ -1072,7 +1076,7 @@ class Mint:
     ):
         """Compare-and-set release; paid outboxes are terminal, never released."""
         with self.db.transaction() as conn:
-            row = conn.get("melts", quote=quote_id)
+            row = conn.get("melts", quote=quote_id, for_update=True)
             if row is None:
                 return
             if row["state"] != "PENDING":
@@ -1093,7 +1097,15 @@ class Mint:
                     },
                     ignore=True,
                 )
-            for input_row in conn.select("melt_inputs", melt=quote_id):
+            inputs = conn.select("melt_inputs", melt=quote_id)
+            conn.select(
+                "quotes",
+                columns=("payment_hash",),
+                in_={"payment_hash": [item["payment_hash"] for item in inputs]},
+                order_by="payment_hash",
+                for_update=True,
+            )
+            for input_row in inputs:
                 updated = conn.mint_release_backing(
                     input_row["payment_hash"], input_row["amount"]
                 )
@@ -1115,8 +1127,7 @@ class Mint:
             hashes = sorted(set(payment_hashes))
             if not hashes:
                 return
-        with self.db.read() as conn:
-            rows = conn.mint_reconcilable(hashes)
+        rows = await self.db.run_read(lambda conn: conn.mint_reconcilable(hashes))
         semaphore = asyncio.Semaphore(8)
 
         async def reconcile(payment_hash: str):
@@ -1139,8 +1150,9 @@ class Mint:
         Backend or data failures propagate so callers can distinguish "not
         due" from "liveness unknown"; the full-scan wrapper isolates them.
         """
-        with self.db.read() as conn:
-            row = conn.get("quotes", payment_hash=payment_hash)
+        row = await self.db.run_read(
+            lambda conn: conn.get("quotes", payment_hash=payment_hash)
+        )
         if (
             row is None
             or not row["issued"]
@@ -1166,21 +1178,23 @@ class Mint:
         if not due:
             return
         if not row["closed"]:
-            with self.db.transaction() as conn:
-                updated = conn.update(
+            updated = await self.db.run_transaction(
+                lambda conn: conn.update(
                     "quotes", {"closed": 1}, payment_hash=payment_hash, closed=0
                 )
-                if updated.rowcount != 1:
-                    return
+            )
+            if updated.rowcount != 1:
+                return
         if invoice.state == InvoiceState.accepted:
             await self.backend.settle_invoice(bytes.fromhex(row["preimage"]))
             invoice = await self.backend.get_invoice(payment_hash)
             self._validate_invoice(invoice, payment_hash, row["amount"])
         if invoice.state in (InvoiceState.settled, InvoiceState.canceled):
-            with self.db.transaction() as conn:
-                conn.update(
+            await self.db.run_transaction(
+                lambda conn: conn.update(
                     "quotes", {"closed": 2}, payment_hash=payment_hash, closed=1
                 )
+            )
 
     def _prune_melt_quotes(self):
         """Delete expired quotes with no recovery value, at most every 5 minutes.
@@ -1204,24 +1218,27 @@ class Mint:
         if now - self._last_mint_prune < 300:
             return
         self._last_mint_prune = now
-        with self.db.read() as conn:
-            rows = conn.mint_prunable_quotes(int(now))
+        rows = await self.db.run_read(lambda conn: conn.mint_prunable_quotes(int(now)))
         semaphore = asyncio.Semaphore(8)
 
         async def prune(payment_hash: str):
             async with semaphore:
                 async with self._hold_locks.hold(payment_hash):
                     try:
-                        with self.db.read() as conn:
-                            rows = conn.mint_prunable_quotes(
+                        rows = await self.db.run_read(
+                            lambda conn: conn.mint_prunable_quotes(
                                 int(now), payment_hash=payment_hash
                             )
+                        )
                         if not rows or not await self.backend.prune_invoice(
                             payment_hash
                         ):
                             return
-                        with self.db.transaction() as conn:
-                            conn.mint_delete_prunable(int(now), payment_hash)
+                        await self.db.run_transaction(
+                            lambda conn: conn.mint_delete_prunable(
+                                int(now), payment_hash
+                            )
+                        )
                     except Exception:
                         # A missing or unreachable backend must not stop other rows;
                         # cancellation (BaseException) still propagates.
@@ -1232,11 +1249,12 @@ class Mint:
     async def resume_pending_melts(self):
         await self.reconcile_holds()
         await self._prune_mint_quotes()
-        self._prune_melt_quotes()
-        with self.db.read() as conn:
-            rows = conn.select(
+        await run_blocking(self._prune_melt_quotes)
+        rows = await self.db.run_read(
+            lambda conn: conn.select(
                 "melts", columns=("request",), state="PENDING", melt_lock=""
             )
+        )
         for row in rows:
             try:
                 await self.melt(MeltRequest.model_validate_json(row["request"]))

@@ -1,16 +1,20 @@
 import fcntl
 import hashlib
 import os
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from typing import TypeVar
 
 import sqlalchemy as sa
 from sqlalchemy.engine import Connection
 from sqlalchemy.pool import NullPool
 from sqlalchemy.schema import CreateSchema
 
+from .concurrency import run_blocking
 from .crud import STORE_METADATA, Crud
+
+T = TypeVar("T")
 
 
 class Database:
@@ -32,22 +36,31 @@ class Database:
         else:
             raise ValueError("database URL must use SQLite or PostgreSQL")
         self.url = url
-        self.engine = sa.create_engine(url, poolclass=NullPool, hide_parameters=True)
+        options = (
+            {"poolclass": NullPool}
+            if self.path is not None
+            else {
+                "pool_size": 5,
+                "max_overflow": 5,
+                "pool_timeout": 10,
+                "pool_pre_ping": True,
+            }
+        )
+        self.engine = sa.create_engine(url, hide_parameters=True, **options)
         if self.path is not None:
             sa.event.listen(self.engine, "connect", self._configure_sqlite)
             self.engine.connect().close()
         else:
             with self.engine.begin() as connection:
                 connection.execute(CreateSchema(schema, if_not_exists=True))
-        identity = f"{url}\0{schema}"
+        # PostgreSQL advisory locks are already scoped to the connected database.
+        # Credentials and host aliases must not change the store's lock key.
+        identity = f"tmp.cash\0{schema}"
         digest = hashlib.sha256(identity.encode()).digest()
         self._singleton_key = int.from_bytes(
             hashlib.sha256(digest + b"singleton").digest()[:8], "big", signed=True
         )
-        self._transaction_key = int.from_bytes(
-            hashlib.sha256(digest + b"transaction").digest()[:8], "big", signed=True
-        )
-        self._lock_identity = identity
+        self._lock_identity = f"{url}\0{schema}"
 
     @staticmethod
     def _configure_sqlite(dbapi_connection, _connection_record) -> None:
@@ -81,10 +94,6 @@ class Database:
                 connection.exec_driver_sql("BEGIN IMMEDIATE")
             else:
                 connection.begin()
-                connection.execute(
-                    sa.text("SELECT pg_advisory_xact_lock(:key)"),
-                    {"key": self._transaction_key},
-                )
             yield Crud(connection, self.schema)
             connection.commit()
         except BaseException:
@@ -92,6 +101,24 @@ class Database:
             raise
         finally:
             connection.close()
+
+    async def run_read(self, operation: Callable[[Crud], T]) -> T:
+        """Run a complete read, including connection acquisition, in a worker."""
+
+        def read():
+            with self.read() as db:
+                return operation(db)
+
+        return await run_blocking(read)
+
+    async def run_transaction(self, operation: Callable[[Crud], T]) -> T:
+        """Keep the connection and the entire transaction in one worker."""
+
+        def transact():
+            with self.transaction() as db:
+                return operation(db)
+
+        return await run_blocking(transact)
 
     def acquire_singleton(self) -> bool:
         if self.path is not None:
@@ -107,6 +134,9 @@ class Database:
             raise MintDatabaseInUse(
                 "mint database is already in use by another mint process"
             )
+        # The session lock survives commit; don't leave its connection idle in
+        # a transaction for the process lifetime.
+        connection.commit()
         _postgres_singleton_locks[self._lock_identity] = connection
         return True
 

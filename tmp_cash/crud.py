@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
@@ -334,6 +335,23 @@ class Crud:
         except KeyError:
             raise ValueError(f"unknown {self.schema} table: {name}") from None
 
+    def lock_keys(self, namespace: str, keys: Iterable[str]) -> None:
+        """Protect specific entities whose rows may not have been inserted yet.
+
+        SQLite's write transaction already owns the writer lock. PostgreSQL
+        needs one transaction lock per entity, never one for the whole store.
+        """
+        if self.dialect != "postgresql":
+            return
+        for key in sorted(set(keys)):
+            identity = f"{self.schema}\0{namespace}\0{key}".encode()
+            lock = int.from_bytes(
+                hashlib.sha256(identity).digest()[:8], "big", signed=True
+            )
+            self.connection.execute(
+                sa.text("SELECT pg_advisory_xact_lock(:key)"), {"key": lock}
+            )
+
     @staticmethod
     def _criteria(table: sa.Table, criteria: Mapping[str, Any]) -> list[ColumnElement]:
         expressions = []
@@ -347,11 +365,14 @@ class Crud:
         table_name: str,
         *,
         columns: Sequence[str] | None = None,
+        for_update: bool = False,
         **criteria: Any,
     ) -> CompatRow | None:
         table = self.table(table_name)
         selected = [table.c[name] for name in columns] if columns else [table]
         statement = sa.select(*selected).where(*self._criteria(table, criteria))
+        if for_update:
+            statement = statement.with_for_update()
         return CompatResult(self.connection.execute(statement)).fetchone()
 
     def select(
@@ -362,6 +383,7 @@ class Crud:
         in_: Mapping[str, Iterable[Any]] | None = None,
         order_by: str | None = None,
         limit: int | None = None,
+        for_update: bool = False,
         **criteria: Any,
     ) -> list[CompatRow]:
         table = self.table(table_name)
@@ -378,6 +400,8 @@ class Crud:
             statement = statement.order_by(order)
         if limit is not None:
             statement = statement.limit(limit)
+        if for_update:
+            statement = statement.with_for_update()
         return CompatResult(self.connection.execute(statement)).fetchall()
 
     def insert(

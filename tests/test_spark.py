@@ -26,6 +26,44 @@ from tmp_cash.sparkl2 import (  # noqa: E402 - optional test dependency
 MNEMONIC = "abandon " * 11 + "about"
 
 
+async def test_independent_payments_and_status_checks_do_not_queue(spark, monkeypatch):
+    backend, sdk = spark
+    slow_request, slow_hash, _ = receiver(sdk, amount=8)
+    fast_request, fast_hash, _ = receiver(sdk, amount=4)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    send = sdk.send_payment
+
+    async def delayed_send(request):
+        payment_hash = (
+            request.prepare_response.payment_method.invoice_details.payment_hash
+        )
+        if payment_hash == slow_hash:
+            started.set()
+            await release.wait()
+        return await send(request)
+
+    monkeypatch.setattr(sdk, "send_payment", delayed_send)
+    slow = asyncio.create_task(backend.pay_invoice(slow_request, 0))
+    retry = status = None
+    try:
+        await asyncio.wait_for(started.wait(), 2)
+        retry = asyncio.create_task(backend.pay_invoice(slow_request, 0))
+        status = asyncio.create_task(backend.get_payment(slow_hash))
+        fast = await asyncio.wait_for(backend.pay_invoice(fast_request, 0), 2)
+        assert fast.state == PaymentState.succeeded
+        assert (await asyncio.wait_for(backend.get_payment(fast_hash), 2)) == fast
+        assert not retry.done() and not status.done() and not slow.done()
+    finally:
+        release.set()
+        results = await asyncio.gather(
+            *(task for task in (slow, retry, status) if task is not None)
+        )
+    assert all(payment == results[0] for payment in results)
+    assert len(sdk.sends) == 2
+    assert backend._payment_locks._entries == {}
+
+
 @pytest.mark.asyncio
 async def test_spark_operator_balance_uses_synchronized_sdk_info(spark, monkeypatch):
     backend, sdk = spark

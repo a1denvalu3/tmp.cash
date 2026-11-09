@@ -15,6 +15,7 @@ import breez_sdk_spark as breez
 from bolt11 import decode
 from pydantic import BaseModel, ConfigDict, Field
 
+from .concurrency import KeyedLocks, run_blocking
 from .crud import SPARK
 from .db import BackendError, Database
 from .lightning import (
@@ -90,8 +91,8 @@ class SparkBackend(HoldInvoiceBackend):
         )
         self.sdk: breez.BreezSdk | None = None
         self._connect_lock = asyncio.Lock()
-        self._invoice_lock = asyncio.Lock()
-        self._payment_lock = asyncio.Lock()
+        self._invoice_locks = KeyedLocks()
+        self._payment_locks = KeyedLocks()
         if storage_dir is None:
             if not isinstance(path, Path):
                 raise ValueError("Spark PostgreSQL storage needs a local SDK directory")
@@ -248,52 +249,52 @@ class SparkBackend(HoldInvoiceBackend):
         self, amount: int, expiry: int = 3600
     ) -> OperatorFundingResponse:
         parameters = OperatorFundingRequest(amount=amount, expiry=expiry)
-        async with self._invoice_lock:
-            sdk = await self._ensure_sdk()
-            try:
-                response = await sdk.receive_payment(
-                    breez.ReceivePaymentRequest(
-                        payment_method=breez.ReceivePaymentMethod.BOLT11_INVOICE(
-                            description="tmp.cash operator liquidity",
-                            amount_sats=parameters.amount,
-                            expiry_secs=parameters.expiry,
-                            # No supplied hash: the SDK owns the preimage and claims
-                            # this payment normally, independently of ecash holds.
-                            payment_hash=None,
-                        )
+        sdk = await self._ensure_sdk()
+        try:
+            response = await sdk.receive_payment(
+                breez.ReceivePaymentRequest(
+                    payment_method=breez.ReceivePaymentMethod.BOLT11_INVOICE(
+                        description="tmp.cash operator liquidity",
+                        amount_sats=parameters.amount,
+                        expiry_secs=parameters.expiry,
+                        # No supplied hash: the SDK owns the preimage and claims
+                        # this payment normally, independently of ecash holds.
+                        payment_hash=None,
                     )
                 )
-                request = response.payment_request
-                payment_hash, invoice_amount = invoice_details(request)
-                decoded = decode(request)
-                if invoice_amount != amount:
-                    raise BackendError("Spark funding invoice amount mismatch")
-                currency = "bc" if self.network == "mainnet" else "bcrt"
-                if decoded.currency != currency:
-                    raise BackendError("Spark funding invoice network mismatch")
-                expires_at = decoded.date + decoded.expiry
-                if expires_at <= int(time.time()):
-                    raise BackendError("Spark funding invoice has already expired")
-                if type(response.fee) is not int or not 0 <= response.fee < amount:
-                    raise BackendError("Spark funding invoice has invalid receive fees")
-                return OperatorFundingResponse(
-                    amount=amount,
-                    request=request,
-                    payment_hash=payment_hash,
-                    expiry=expires_at,
-                    fee=response.fee,
-                )
-            except BackendError:
-                raise
-            except Exception:
-                raise BackendError("Spark funding invoice creation failed") from None
+            )
+            request = response.payment_request
+            payment_hash, invoice_amount = invoice_details(request)
+            decoded = decode(request)
+            if invoice_amount != amount:
+                raise BackendError("Spark funding invoice amount mismatch")
+            currency = "bc" if self.network == "mainnet" else "bcrt"
+            if decoded.currency != currency:
+                raise BackendError("Spark funding invoice network mismatch")
+            expires_at = decoded.date + decoded.expiry
+            if expires_at <= int(time.time()):
+                raise BackendError("Spark funding invoice has already expired")
+            if type(response.fee) is not int or not 0 <= response.fee < amount:
+                raise BackendError("Spark funding invoice has invalid receive fees")
+            return OperatorFundingResponse(
+                amount=amount,
+                request=request,
+                payment_hash=payment_hash,
+                expiry=expires_at,
+                fee=response.fee,
+            )
+        except BackendError:
+            raise
+        except Exception:
+            raise BackendError("Spark funding invoice creation failed") from None
 
     async def create_hold_invoice(
         self, amount: int, payment_hash: str, expiry: int
     ) -> Invoice:
-        async with self._invoice_lock:
-            with self.db.read() as conn:
-                row = conn.get("invoices", payment_hash=payment_hash)
+        async with self._invoice_locks.hold(payment_hash):
+            row = await self.db.run_read(
+                lambda conn: conn.get("invoices", payment_hash=payment_hash)
+            )
             if row is not None:
                 if row["amount"] != amount:
                     raise BackendError(
@@ -319,8 +320,8 @@ class SparkBackend(HoldInvoiceBackend):
                         raise BackendError("Spark backing invoice/hash/amount mismatch")
                     decoded = decode(request)
                     self._validate_cltv(decoded.min_final_cltv_expiry)
-                    with self.db.transaction() as conn:
-                        conn.insert(
+                    await self.db.run_transaction(
+                        lambda conn: conn.insert(
                             "invoices",
                             {
                                 "payment_hash": payment_hash,
@@ -329,6 +330,7 @@ class SparkBackend(HoldInvoiceBackend):
                                 "expiry": decoded.date + decoded.expiry,
                             },
                         )
+                    )
                 except BackendError:
                     raise
                 except Exception:
@@ -346,8 +348,9 @@ class SparkBackend(HoldInvoiceBackend):
             )
 
     async def get_invoice(self, payment_hash: str) -> Invoice:
-        with self.db.read() as conn:
-            row = conn.get("invoices", payment_hash=payment_hash)
+        row = await self.db.run_read(
+            lambda conn: conn.get("invoices", payment_hash=payment_hash)
+        )
         if row is None:
             raise BackendError("unknown Spark hold invoice")
         self._validate_cltv(decode(row["request"]).min_final_cltv_expiry)
@@ -406,11 +409,13 @@ class SparkBackend(HoldInvoiceBackend):
                     )
                 else:
                     raise BackendError("Spark returned an unknown backing state")
-            with self.db.transaction() as conn:
+
+            def reconcile(conn):
                 current = conn.get(
                     "invoices",
                     columns=("state", "hold_expires_at"),
                     payment_hash=payment_hash,
+                    for_update=True,
                 )
                 if current is None:
                     raise BackendError("Spark hold invoice disappeared during lookup")
@@ -418,21 +423,23 @@ class SparkBackend(HoldInvoiceBackend):
                 if current_state in {InvoiceState.settled, InvoiceState.canceled}:
                     # A concurrent lookup may have confirmed closure while this
                     # lookup was awaiting an older SDK snapshot.
-                    state = current_state
-                    deadline = current["hold_expires_at"]
-                elif (
+                    return current_state, current["hold_expires_at"]
+                if (
                     state == InvoiceState.open
                     and current_state == InvoiceState.accepted
                 ):
                     raise BackendError(
                         "Spark accepted backing lookup unavailable; retry to reconcile"
                     )
-                elif state != InvoiceState.open:
+                if state != InvoiceState.open:
                     conn.update(
                         "invoices",
                         {"state": state.value, "hold_expires_at": deadline},
                         payment_hash=payment_hash,
                     )
+                return state, deadline
+
+            state, deadline = await self.db.run_transaction(reconcile)
         return Invoice(
             payment_hash=payment_hash,
             amount=row["amount"],
@@ -444,10 +451,11 @@ class SparkBackend(HoldInvoiceBackend):
         )
 
     async def prune_invoice(self, payment_hash: str) -> bool:
-        with self.db.read() as conn:
-            row = conn.get(
+        row = await self.db.run_read(
+            lambda conn: conn.get(
                 "invoices", columns=("payment_hash",), payment_hash=payment_hash
             )
+        )
         if row is None:
             return True
         invoice = await self.get_invoice(payment_hash)
@@ -457,8 +465,9 @@ class SparkBackend(HoldInvoiceBackend):
             or invoice.expiry > int(time.time())
         ):
             return False
-        with self.db.transaction() as conn:
-            deleted = conn.spark_prune_invoice(payment_hash, int(time.time()))
+        deleted = await self.db.run_transaction(
+            lambda conn: conn.spark_prune_invoice(payment_hash, int(time.time()))
+        )
         return deleted.rowcount == 1
 
     async def get_block_height(self) -> int | None:
@@ -581,7 +590,8 @@ class SparkBackend(HoldInvoiceBackend):
                     idempotency_key=row["idempotency_key"],
                 )
             )
-            return self._save_payment(
+            return await run_blocking(
+                self._save_payment,
                 row["payment_hash"],
                 self._payment(response.payment, row["payment_hash"]),
             )
@@ -591,16 +601,17 @@ class SparkBackend(HoldInvoiceBackend):
             raise BackendError("Spark payout interrupted; retry to reconcile") from None
 
     async def get_payment(self, payment_hash: str) -> Payment | None:
-        async with self._payment_lock:
-            with self.db.read() as conn:
-                row = conn.get("payments", payment_hash=payment_hash)
+        async with self._payment_locks.hold(payment_hash):
+            row = await self.db.run_read(
+                lambda conn: conn.get("payments", payment_hash=payment_hash)
+            )
             if row is not None and row["state"] == PaymentState.succeeded.value:
                 return Payment(PaymentState.succeeded, row["preimage"], row["fee_msat"])
             attempts = await self._find_payments(payment_hash, breez.PaymentType.SEND)
             if attempts:
                 outcome = self._send_outcome(attempts, payment_hash)
                 if outcome.state != PaymentState.failed:
-                    return self._save_payment(payment_hash, outcome)
+                    return await run_blocking(self._save_payment, payment_hash, outcome)
             if row is None:
                 return Payment(PaymentState.failed) if attempts else None
             if row["state"] == PaymentState.failed.value:
@@ -609,7 +620,9 @@ class SparkBackend(HoldInvoiceBackend):
                 attempt.id for attempt in attempts
             }:
                 # Every matching attempt, including the stored one, failed.
-                return self._save_payment(payment_hash, Payment(PaymentState.failed))
+                return await run_blocking(
+                    self._save_payment, payment_hash, Payment(PaymentState.failed)
+                )
             # The stored attempt is missing from the SDK cache, so the cached
             # records cannot prove its outcome. Reuse the durable SDK transfer
             # UUID even if the original call died before the SDK wrote its
@@ -629,9 +642,10 @@ class SparkBackend(HoldInvoiceBackend):
         if cltv_limit is not None and (type(cltv_limit) is not int or cltv_limit < 0):
             raise ValueError("CLTV limit must be nonnegative blocks")
         payment_hash, _ = invoice_details(request)
-        async with self._payment_lock:
-            with self.db.read() as conn:
-                row = conn.get("payments", payment_hash=payment_hash)
+        async with self._payment_locks.hold(payment_hash):
+            row = await self.db.run_read(
+                lambda conn: conn.get("payments", payment_hash=payment_hash)
+            )
             if row is not None:
                 if row["request"] != request:
                     raise BackendError("Spark payout hash already has another invoice")
@@ -643,7 +657,7 @@ class SparkBackend(HoldInvoiceBackend):
             if attempts:
                 result = self._send_outcome(attempts, payment_hash)
                 if result.state != PaymentState.failed:
-                    return self._save_payment(payment_hash, result)
+                    return await run_blocking(self._save_payment, payment_hash, result)
             if (
                 row is not None
                 and row["state"] != PaymentState.failed.value
@@ -686,7 +700,8 @@ class SparkBackend(HoldInvoiceBackend):
                 raise
             except Exception:
                 raise BackendError("Spark payout preparation failed") from None
-            with self.db.transaction() as conn:
+
+            def save(conn):
                 conn.insert(
                     "payments",
                     {
@@ -700,6 +715,9 @@ class SparkBackend(HoldInvoiceBackend):
                     replace=True,
                 )
                 row = conn.get("payments", payment_hash=payment_hash)
+                return row
+
+            row = await self.db.run_transaction(save)
             return await self._send(row, prepared)
 
     async def get_balances(self) -> dict[str, int]:

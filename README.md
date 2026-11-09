@@ -98,11 +98,22 @@ TMP_CASH_DATABASE_URL=postgresql://user:password@127.0.0.1:5432/tmpcash
 
 The mint, fake backend, Spark adapter, and CLI wallet accept this URL. Each
 store uses a separate PostgreSQL schema, so they can share a database without
-table-name collisions. SQLite write transactions use `BEGIN IMMEDIATE`;
-PostgreSQL uses advisory transaction locks. The mint's singleton ownership
+table-name collisions. SQLite write transactions use `BEGIN IMMEDIATE`.
+PostgreSQL allows unrelated writes to overlap, using row locks and conditional
+updates for shared backing and outbox rows. Wallet recovery uses transaction
+locks scoped to individual operations, quotes, and tokens, including entities
+whose rows have not yet been inserted. The mint's singleton ownership
 uses a file lock for SQLite and an advisory session lock for PostgreSQL.
 Spark's SDK storage remains on the local filesystem under the mint data
 directory.
+
+PostgreSQL connections are reused through a bounded pool per store (5 retained
+connections, up to 5 additional connections during bursts). Async request and
+recovery paths run database connection acquisition, queries, and complete
+transactions in worker threads. Cancellation waits for started database work
+to finish before releasing operation locks. Spark outgoing payments and status
+lookups share a lock per payment hash: independent invoices proceed concurrently,
+while retries of the same invoice retain one durable idempotency key.
 
 Run the optional PostgreSQL integration tests against an empty test database
 with `TMP_CASH_TEST_POSTGRES_URL` set to its URL. Tests drop and recreate the
