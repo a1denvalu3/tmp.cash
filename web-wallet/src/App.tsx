@@ -1287,6 +1287,9 @@ export function App() {
         <a className="text-button small wallet-privacy-link" href="/privacy/">
           Privacy policy
         </a>
+        <a className="text-button small wallet-terms-link" href="/terms/">
+          Terms of service
+        </a>
       </footer>
       {cloudBackups.prompt}
       {dialog && (

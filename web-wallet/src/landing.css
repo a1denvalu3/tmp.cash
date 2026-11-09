@@ -902,7 +902,6 @@
   transform: rotate(-15deg);
 }
 .landing .landing-footer {
-  flex-wrap: wrap;
   font-size: 10px;
 }
 .landing-footer > .text-button {
