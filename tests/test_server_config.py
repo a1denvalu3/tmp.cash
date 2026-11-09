@@ -344,3 +344,19 @@ def test_startup_reports_old_database_without_resetting_it(tmp_path, monkeypatch
             r[0]
             for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")
         } == {"metadata", "quotes"}
+
+
+def test_database_url_selects_postgres_for_configured_stores(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    url = "postgresql://user:password@db.test/tmpcash"
+    locations = []
+
+    class Backend:
+        def __init__(self, location, **kwargs):
+            locations.append(location)
+
+    monkeypatch.setattr("tmp_cash.server.FakeBackend", Backend)
+    create_backend(parse_args(["--database-url", url]))
+    monkeypatch.setenv("TMP_CASH_DATABASE_URL", url)
+    create_backend(parse_args([]))
+    assert locations == [url, url]

@@ -84,6 +84,41 @@ remain accepted for upgrades. Environment variables override `.env`; within
 each source, the new names take precedence. Keep the existing data directory
 and mint seed when upgrading an existing v3 installation.
 
+### Database storage
+
+Application database access is centralized in `tmp_cash/crud.py` using
+SQLAlchemy Core. SQLite remains the default, with existing files and schema
+migrations preserved. PostgreSQL is supported by installing the extra and
+setting one URL for all application stores:
+
+```bash
+poetry install -E postgresql
+TMP_CASH_DATABASE_URL=postgresql://user:password@127.0.0.1:5432/tmpcash
+```
+
+The mint, fake backend, Spark adapter, and CLI wallet accept this URL. Each
+store uses a separate PostgreSQL schema, so they can share a database without
+table-name collisions. SQLite write transactions use `BEGIN IMMEDIATE`.
+PostgreSQL allows unrelated writes to overlap, using row locks and conditional
+updates for shared backing and outbox rows. Wallet recovery uses transaction
+locks scoped to individual operations, quotes, and tokens, including entities
+whose rows have not yet been inserted. The mint's singleton ownership
+uses a file lock for SQLite and an advisory session lock for PostgreSQL.
+Spark's SDK storage remains on the local filesystem under the mint data
+directory.
+
+PostgreSQL connections are reused through a bounded pool per store (5 retained
+connections, up to 5 additional connections during bursts). Async request and
+recovery paths run database connection acquisition, queries, and complete
+transactions in worker threads. Cancellation waits for started database work
+to finish before releasing operation locks. Spark outgoing payments and status
+lookups share a lock per payment hash: independent invoices proceed concurrently,
+while retries of the same invoice retain one durable idempotency key.
+
+Run the optional PostgreSQL integration tests against an empty test database
+with `TMP_CASH_TEST_POSTGRES_URL` set to its URL. Tests drop and recreate the
+application schemas, so never use a production database for them.
+
 The rebrand preserves v3 token encodings, cryptographic domains, browser storage
 identifiers, and encrypted backup formats so existing funds and backups remain
 readable. Vendored Cashu/Coco package names, upstream attribution, and external
@@ -494,7 +529,7 @@ metadata, input order, the exact melt quote and change commitments are bound
 into every spending proof.
 
 The mint reserves input nullifiers, each group's selected face value and the
-payout hash in one SQLite transaction. It retains the revealed backing
+payout hash in one database transaction. It retains the revealed backing
 preimages before payment. A confirmed payment, change signatures and consumed
 value are stored atomically **before** full-consumption settlement. A response
 lost after payout is recovered from Lightning's tracked payment without paying

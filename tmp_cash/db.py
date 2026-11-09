@@ -1,46 +1,144 @@
 import fcntl
+import hashlib
 import os
-import sqlite3
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import TypeVar
+
+import sqlalchemy as sa
+from sqlalchemy.engine import Connection
+from sqlalchemy.pool import NullPool
+from sqlalchemy.schema import CreateSchema
+
+from .concurrency import run_blocking
+from .crud import STORE_METADATA, Crud
+
+T = TypeVar("T")
 
 
 class Database:
-    """Short SQLite transactions; network calls never hold a write lock."""
+    """Short transactions with one CRUD interface per logical data store."""
 
-    def __init__(self, path: Path):
-        self.path = path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with self.read() as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
+    def __init__(self, location: Path | str, schema: str):
+        if schema not in STORE_METADATA:
+            raise ValueError(f"unknown database schema: {schema}")
+        self.schema = schema
+        raw = str(location)
+        self.path = Path(location) if "://" not in raw else None
+        if self.path is not None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            url = f"sqlite:///{self.path}"
+        elif raw.startswith("postgresql://"):
+            url = "postgresql+psycopg://" + raw.removeprefix("postgresql://")
+        elif raw.startswith("postgresql+psycopg://"):
+            url = raw
+        else:
+            raise ValueError("database URL must use SQLite or PostgreSQL")
+        self.url = url
+        options = (
+            {"poolclass": NullPool}
+            if self.path is not None
+            else {
+                "pool_size": 5,
+                "max_overflow": 5,
+                "pool_timeout": 10,
+                "pool_pre_ping": True,
+            }
+        )
+        self.engine = sa.create_engine(url, hide_parameters=True, **options)
+        if self.path is not None:
+            sa.event.listen(self.engine, "connect", self._configure_sqlite)
+            self.engine.connect().close()
+        else:
+            with self.engine.begin() as connection:
+                connection.execute(CreateSchema(schema, if_not_exists=True))
+        # PostgreSQL advisory locks are already scoped to the connected database.
+        # Credentials and host aliases must not change the store's lock key.
+        identity = f"tmp.cash\0{schema}"
+        digest = hashlib.sha256(identity.encode()).digest()
+        self._singleton_key = int.from_bytes(
+            hashlib.sha256(digest + b"singleton").digest()[:8], "big", signed=True
+        )
+        self._lock_identity = f"{url}\0{schema}"
 
-    def connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path, timeout=10, isolation_level=None)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys=ON")
-        return conn
-
-    @contextmanager
-    def read(self) -> Iterator[sqlite3.Connection]:
-        conn = self.connect()
+    @staticmethod
+    def _configure_sqlite(dbapi_connection, _connection_record) -> None:
+        cursor = dbapi_connection.cursor()
         try:
-            yield conn
+            cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.execute("PRAGMA journal_mode=WAL")
         finally:
-            conn.close()
+            cursor.close()
+
+    def connect(self) -> Connection:
+        connection = self.engine.connect()
+        translated = None if self.path is not None else self.schema
+        return connection.execution_options(
+            schema_translate_map={self.schema: translated}
+        )
 
     @contextmanager
-    def transaction(self) -> Iterator[sqlite3.Connection]:
-        conn = self.connect()
+    def read(self) -> Iterator[Crud]:
+        connection = self.connect()
         try:
-            conn.execute("BEGIN IMMEDIATE")
-            yield conn
-            conn.commit()
+            yield Crud(connection, self.schema)
+        finally:
+            connection.close()
+
+    @contextmanager
+    def transaction(self) -> Iterator[Crud]:
+        connection = self.connect()
+        try:
+            if self.path is not None:
+                connection.exec_driver_sql("BEGIN IMMEDIATE")
+            else:
+                connection.begin()
+            yield Crud(connection, self.schema)
+            connection.commit()
         except BaseException:
-            conn.rollback()
+            connection.rollback()
             raise
         finally:
-            conn.close()
+            connection.close()
+
+    async def run_read(self, operation: Callable[[Crud], T]) -> T:
+        """Run a complete read, including connection acquisition, in a worker."""
+
+        def read():
+            with self.read() as db:
+                return operation(db)
+
+        return await run_blocking(read)
+
+    async def run_transaction(self, operation: Callable[[Crud], T]) -> T:
+        """Keep the connection and the entire transaction in one worker."""
+
+        def transact():
+            with self.transaction() as db:
+                return operation(db)
+
+        return await run_blocking(transact)
+
+    def acquire_singleton(self) -> bool:
+        if self.path is not None:
+            return acquire_singleton_lock(self.path)
+        if self._lock_identity in _postgres_singleton_locks:
+            return False
+        connection = self.engine.connect()
+        acquired = connection.execute(
+            sa.text("SELECT pg_try_advisory_lock(:key)"), {"key": self._singleton_key}
+        ).scalar()
+        if not acquired:
+            connection.close()
+            raise MintDatabaseInUse(
+                "mint database is already in use by another mint process"
+            )
+        # The session lock survives commit; don't leave its connection idle in
+        # a transaction for the process lifetime.
+        connection.commit()
+        _postgres_singleton_locks[self._lock_identity] = connection
+        return True
 
 
 class MintError(Exception):
@@ -62,6 +160,7 @@ class MintDatabaseInUse(RuntimeError):
 
 
 _singleton_locks: dict[Path, int] = {}
+_postgres_singleton_locks: dict[str, Connection] = {}
 
 
 def acquire_singleton_lock(path: Path) -> bool:

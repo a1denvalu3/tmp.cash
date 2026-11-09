@@ -5,7 +5,6 @@ import os
 import shlex
 import sys
 import time
-from pathlib import Path
 
 import httpx
 
@@ -95,7 +94,7 @@ def main() -> None:
         description="tmp.cash wallet for denominated, expiring Lightning HTLC tokens",
     )
     parser.add_argument("--mint", help="mint URL (default: http://127.0.0.1:3338)")
-    parser.add_argument("--wallet", type=Path, default=Path("data/wallet-v3.sqlite3"))
+    parser.add_argument("--wallet", default="data/wallet-v3.sqlite3")
     sub = parser.add_subparsers(dest="command", required=True)
     quote = sub.add_parser("quote")
     quote.add_argument("amount", type=int)
@@ -139,14 +138,10 @@ def main() -> None:
     sub.add_parser("abandon").add_argument("operation_id")
     accept = sub.add_parser("dev-accept")
     accept.add_argument("payment_hash")
-    accept.add_argument(
-        "--backend-db", type=Path, default=Path("data/mint-v3/fake.sqlite3")
-    )
+    accept.add_argument("--backend-db", default="data/mint-v3/fake.sqlite3")
     receiver = sub.add_parser("dev-invoice")
     receiver.add_argument("amount", type=int)
-    receiver.add_argument(
-        "--backend-db", type=Path, default=Path("data/mint-v3/fake.sqlite3")
-    )
+    receiver.add_argument("--backend-db", default="data/mint-v3/fake.sqlite3")
     args = parser.parse_args()
     client = None
     try:
