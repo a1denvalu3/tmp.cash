@@ -33,6 +33,7 @@ import {
   restoreAppleSession,
 } from "./apple-cloud";
 import { Modal } from "./Modal";
+import { diagnoseAction } from "./diagnostics";
 
 export const UNENCRYPTED_WARNING =
   "Anyone who can read this backup, including your cloud storage provider or someone who gets into your account, can read your wallet secrets and spend your funds. A backup password adds protection that your account alone cannot provide.";
@@ -354,11 +355,36 @@ export function useCloudBackups(
       throw new Error(
         "Please confirm that you understand who can access this backup.",
       );
-    const raw = await client.download(selected.id);
-    if (isEncryptedBackup(raw) !== selected.encrypted)
+    // Discovery can be stale, or the original device can save again while the
+    // user chooses a wallet. Resolve its latest copy before importing anything.
+    const files = await client.list();
+    setBackups(files);
+    const backup = files
+      .filter((value) => value.walletId === selected.walletId)
+      .sort((a, b) => b.updated - a.updated)[0];
+    if (!backup)
+      throw new Error(
+        "This saved wallet is no longer available. Choose another saved wallet.",
+      );
+    setSelected(backup);
+    if (backup.encrypted !== selected.encrypted) {
+      setPassword("");
+      setAcknowledged(false);
+      throw new Error(
+        "The backup protection changed. Review it before restoring.",
+      );
+    }
+    const raw = await client.download(backup.id);
+    if (isEncryptedBackup(raw) !== backup.encrypted)
       throw new Error("This saved wallet changed. Please select it again.");
-    const data = await restoreBackup(raw, password),
-      encryption = selected.encrypted ? await createBackupKey(password) : null;
+    const data = await restoreBackup(raw, password);
+    if (!Object.values(data.state).some((records) => records.length > 0))
+      throw new Error(
+        "This saved copy is empty. Choose another saved wallet or save a new backup from the original wallet.",
+      );
+    const encryption = backup.encrypted
+      ? await createBackupKey(password)
+      : null;
     await pauseCloud();
     await onRestored(data);
     currentMint.current = data.mint;
@@ -367,7 +393,7 @@ export function useCloudBackups(
       storage: "provider-v1",
       account: client.user.account,
       id: crypto.randomUUID(),
-      name: selected.name,
+      name: backup.name,
       encryption,
       fingerprint: "",
       updated: 0,
@@ -692,7 +718,7 @@ export function useCloudBackups(
           <form
             onSubmit={(event) => {
               event.preventDefault();
-              void action(restore);
+              void action(() => diagnoseAction("restore", restore));
             }}
           >
             <div className="backup-account">
@@ -740,6 +766,21 @@ export function useCloudBackups(
                 <ArrowRight size={18} />
               )}
               Restore my wallet
+            </button>
+            <button
+              type="button"
+              className="text-button centered"
+              disabled={working}
+              onClick={() => {
+                setSelected(null);
+                setPassword("");
+                setAcknowledged(false);
+                setError("");
+                setStep("choose");
+              }}
+            >
+              <ArrowLeft size={15} />
+              Choose another saved wallet
             </button>
             <p className="small muted backup-note">
               Use one active copy of a restored wallet to avoid competing

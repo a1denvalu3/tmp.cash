@@ -233,7 +233,9 @@ async function fund(page: Page, value: number) {
   });
   await page.getByRole("button", { name: "Check payment" }).click();
   await expect(
-    page.getByText(`${value} sats received`, { exact: true }),
+    page.getByText(`${value.toLocaleString("en-US")} sats received`, {
+      exact: true,
+    }),
   ).toBeVisible();
   await page.getByRole("button", { name: "Back to wallet" }).click();
 }
@@ -345,6 +347,99 @@ for (const encrypted of [true, false]) {
     await fresh.close();
   });
 }
+
+test("restores the latest saved balance when discovery returned an older empty copy", async ({
+  page,
+  context,
+  browser,
+}) => {
+  const state = providerState();
+  await providers(context, state);
+  await welcome(page);
+  await signIn(page);
+  await chooseProtection(page, true, "My latest wallet");
+  await finish(page);
+  const empty = [...state.files.values()][0];
+  await fund(page, 1000);
+  await expect
+    .poll(() => state.files.size, { timeout: 12000 })
+    .toBeGreaterThan(1);
+  await expect(page.getByTestId("balance")).toHaveText("1,000sats");
+
+  const fresh = await browser.newContext();
+  try {
+    await providers(fresh, state);
+    let stale = true;
+    await fresh.route(
+      "https://www.googleapis.com/drive/v3/files?*",
+      (route) => {
+        if (!stale) return route.fallback();
+        stale = false;
+        const { payload: _, ...file } = empty;
+        return route.fulfill({ json: { files: [file] } });
+      },
+    );
+    const restored = await fresh.newPage();
+    await welcome(restored);
+    await signIn(restored);
+    expect(stale).toBe(false);
+    await restored.getByRole("button", { name: /My latest wallet/ }).click();
+    await restored
+      .getByLabel("Backup password", { exact: true })
+      .fill(passphrase);
+    await restored.getByRole("button", { name: "Restore my wallet" }).click();
+    await expect(
+      restored.getByRole("dialog", { name: "Your wallet is backed up." }),
+    ).toBeVisible();
+    await restored.getByRole("button", { name: "Back to my wallet" }).click();
+    await expect(restored.getByTestId("balance")).toHaveText("1,000sats");
+    expect(state.mintLeaks).toEqual([]);
+  } finally {
+    await fresh.close();
+  }
+});
+
+test("does not report recovery success or create another backup when a saved copy is empty", async ({
+  page,
+  context,
+  browser,
+}) => {
+  const state = providerState();
+  await providers(context, state);
+  await welcome(page);
+  await signIn(page);
+  await chooseProtection(page, true, "My empty wallet");
+  await finish(page);
+  const uploads = state.uploads;
+  const fresh = await browser.newContext();
+  try {
+    await providers(fresh, state);
+    const restored = await fresh.newPage();
+    await welcome(restored);
+    await signIn(restored);
+    await restored.getByRole("button", { name: /My empty wallet/ }).click();
+    await restored
+      .getByLabel("Backup password", { exact: true })
+      .fill(passphrase);
+    await restored.getByRole("button", { name: "Restore my wallet" }).click();
+    await expect(restored.getByRole("alert")).toContainText(
+      "saved copy is empty",
+    );
+    await expect(
+      restored.getByRole("dialog", { name: "Let’s restore your wallet." }),
+    ).toBeVisible();
+    expect(state.uploads).toBe(uploads);
+    await restored
+      .getByRole("button", { name: "Choose another saved wallet" })
+      .click();
+    await expect(
+      restored.getByRole("button", { name: /My empty wallet/ }),
+    ).toBeVisible();
+    expect(state.mintLeaks).toEqual([]);
+  } finally {
+    await fresh.close();
+  }
+});
 
 test("retries an accepted upload after response loss and reload without creating a conflicting snapshot", async ({
   page,

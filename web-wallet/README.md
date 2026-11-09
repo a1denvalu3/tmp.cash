@@ -333,6 +333,10 @@ user's cloud quota and remain until deleted; there is no automatic pruning.
 Google listings are bounded to the newest 1,000 files and Apple to 200 manifests.
 
 Restore requires an empty local wallet and validates the complete wallet state.
+Recovery rechecks the newest saved copy for the chosen wallet before downloading
+it, so an older discovery result does not hide a more recent save. A completely
+empty copy reports an error and offers another wallet instead of reporting
+successful recovery and creating another empty backup.
 It includes proofs, backing preimages, pending requests, funding recovery data,
 and activity. A successful restore enables continued automatic backups using the
 same protection choice. Use one active copy to avoid competing spends. Backups
