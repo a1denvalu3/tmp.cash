@@ -179,7 +179,6 @@ export class PSWallet {
         scheme: z.literal("PS/BLS12-381"),
         token_version: z.literal(3),
         swap_request_version: z.literal(3),
-        swap: z.literal("same-htlc-many-to-many"),
         default_token_lifetime_blocks: z
           .number()
           .int()
