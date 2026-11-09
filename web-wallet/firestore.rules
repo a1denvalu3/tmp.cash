@@ -1,0 +1,41 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function owner(uid) {
+      return request.auth != null && request.auth.uid == uid;
+    }
+    function validProtection(p) {
+      return (p.keys().hasOnly(['mode']) && p.mode == 'plaintext') ||
+        (p.keys().hasOnly(['mode', 'salt']) && p.mode == 'passphrase' &&
+          p.salt is string && p.salt.size() == 24);
+    }
+    function validManifest(d) {
+      return d.keys().hasOnly(['version', 'revision', 'count', 'protection', 'updatedAt']) &&
+        d.version == 1 && d.revision is int && d.revision > 0 &&
+        d.count is int && d.count >= 1 && d.count <= 16 &&
+        d.updatedAt == request.time && validProtection(d.protection);
+    }
+    match /wallets/{uid} {
+      allow read: if owner(uid);
+      allow create: if owner(uid) && validManifest(request.resource.data) && request.resource.data.revision == 1;
+      allow update: if owner(uid) && validManifest(request.resource.data) &&
+        request.resource.data.revision == resource.data.revision + 1 &&
+        request.resource.data.protection == resource.data.protection;
+      allow delete: if false;
+      match /chunks/{index} {
+        function manifest() {
+          return getAfter(/databases/$(database)/documents/wallets/$(uid)).data;
+        }
+        allow read: if owner(uid);
+        allow create, update: if owner(uid) && index.matches('^(0|[1-9][0-9]?)$') &&
+          int(index) < manifest().count &&
+          request.resource.data.keys().hasOnly(['revision', 'data']) &&
+          request.resource.data.revision == manifest().revision &&
+          request.resource.data.data is string && request.resource.data.data.size() <= 500000 &&
+          (!exists(/databases/$(database)/documents/wallets/$(uid)/chunks/$(index)) ||
+            resource.data.revision < request.resource.data.revision);
+        allow delete: if owner(uid) && resource.data.revision < manifest().revision && int(index) >= manifest().count;
+      }
+    }
+  }
+}

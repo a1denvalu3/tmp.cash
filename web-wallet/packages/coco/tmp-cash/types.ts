@@ -76,6 +76,8 @@ export interface TmpCashState {
   activity: TmpCashActivity[];
 }
 export interface TmpCashRepository {
+  /** Fetch shared state before selecting inputs or observing remote proof states. */
+  synchronize?(): Promise<void>;
   read(): Promise<TmpCashState>;
   saveFunding(funding: TmpCashFunding): Promise<void>;
   updateFunding(funding: TmpCashFunding): Promise<void>;

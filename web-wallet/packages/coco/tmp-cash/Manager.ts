@@ -50,11 +50,15 @@ export class TmpCashManager {
     await this.refresh();
   }
   private exclusive<T>(fn: () => Promise<T>): Promise<T> {
+    const synchronized = async () => {
+      await this.repo.synchronize?.();
+      return fn();
+    };
     const run = async (): Promise<T> =>
       typeof navigator !== "undefined" && navigator.locks
         ? // Coordinate writes with tabs opened before the tmp.cash rebrand too.
-          await navigator.locks.request("cashu-layer3-wallet", fn)
-        : await fn();
+          await navigator.locks.request("cashu-layer3-wallet", synchronized)
+        : await synchronized();
     const task = this.queue.then(run, run);
     this.queue = task.catch(() => undefined);
     return task;
