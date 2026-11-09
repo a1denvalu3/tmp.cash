@@ -35,6 +35,7 @@ import {
   TmpCashManager,
   type TmpCashFunding,
   type TmpCashView,
+  type TmpCashRepository,
 } from "coco-cashu-core/tmp-cash";
 import { TmpCashIndexedDbRepository } from "coco-cashu-indexeddb/tmp-cash";
 import {
@@ -78,12 +79,29 @@ import {
   type DiagnosticAction,
 } from "./diagnostics";
 
-const repo = new TmpCashIndexedDbRepository();
+const localRepo = new TmpCashIndexedDbRepository();
 const GoogleRecovery = lazy(() =>
   import("./GoogleRecovery").then((module) => ({
     default: module.GoogleRecovery,
   })),
 );
+const SharedWallet = lazy(() =>
+  import("./SharedWallet").then((module) => ({ default: module.SharedWallet })),
+);
+const syncEnabled =
+  googleConfigured && import.meta.env.VITE_FIREBASE_SYNC_ENABLED === "true";
+function initialRepository(): TmpCashRepository | null {
+  try {
+    if (
+      syncEnabled &&
+      localStorage.getItem("tmp.cash-shared-wallet") === "true"
+    )
+      return null;
+  } catch {
+    /* A local wallet can still open when preferences are unavailable. */
+  }
+  return localRepo;
+}
 const defaultMint =
   import.meta.env.VITE_DEFAULT_MINT || "http://127.0.0.1:3338";
 const initialMint = (() => {
@@ -298,6 +316,7 @@ function ActivityRow({
 }
 
 export function App() {
+  const [repo, setRepo] = useState<TmpCashRepository | null>(initialRepository);
   const { preference, theme, changePreference } = useTheme();
   const [mintUrl, setMintUrl] = useState(initialMint),
     [mintInput, setMintInput] = useState(initialMint);
@@ -332,6 +351,19 @@ export function App() {
   const [tick, setTick] = useState(0),
     [reconnect, setReconnect] = useState(0);
   const busyRef = useRef(false);
+  const selectRepository = useCallback(
+    (next: TmpCashRepository | null | "local", mint?: string) => {
+      setManager(null);
+      setView(null);
+      setRepo(next === "local" ? localRepo : next);
+      if (mint) {
+        setMintUrl(mint);
+        setMintInput(mint);
+      }
+      setReconnect((value) => value + 1);
+    },
+    [],
+  );
   const meltQuoteVersion = useRef(0);
   const fundingRef = useRef<TmpCashFunding | null>(null);
   const updateInvoice = useCallback((value: string) => {
@@ -387,6 +419,13 @@ export function App() {
 
   useEffect(() => {
     let active = true;
+    if (!repo) {
+      setManager(null);
+      setView(null);
+      setConnecting(false);
+      setConnectionError("Unlock your Google wallet in Settings");
+      return;
+    }
     let previousBalance = "";
     const observedQuotes = new Set<string>();
     const m = new TmpCashManager(repo, mintUrl, diagnosticFetch);
@@ -480,13 +519,13 @@ export function App() {
       unsubscribe();
       clearInterval(refresh);
     };
-  }, [mintUrl, reconnect]);
+  }, [mintUrl, reconnect, repo]);
   useEffect(() => {
     const timer = setInterval(() => setTick((n) => n + 1), 1000);
     return () => clearInterval(timer);
   }, []);
   useEffect(() => {
-    if (!manager) return;
+    if (!manager || !repo) return;
     let active = true,
       polling = false;
     const poll = async () => {
@@ -532,7 +571,7 @@ export function App() {
       active = false;
       clearInterval(timer);
     };
-  }, [manager, mintUrl, dialog]);
+  }, [manager, mintUrl, dialog, repo]);
 
   async function run<T>(
     action: DiagnosticAction,
@@ -586,6 +625,7 @@ export function App() {
     }
   }
   async function restoreWallet(raw: string, passphrase: string) {
+    if (!repo) throw new Error("Unlock your Google wallet before restoring");
     const restored = await restoreBackup(raw, passphrase);
     await repo.importState(restored.state);
     localStorage.setItem("layer3-mint", restored.mint);
@@ -802,7 +842,13 @@ export function App() {
             <section className="balance-card" aria-label="Wallet balance">
               <div className="balance-main">
                 <div className="balance-label">
-                  <span className="eyebrow">AVAILABLE TO SPEND</span>
+                  <span className="eyebrow">
+                    {syncEnabled
+                      ? repo === localRepo
+                        ? "LOCAL WALLET"
+                        : "GOOGLE WALLET"
+                      : "AVAILABLE TO SPEND"}
+                  </span>
                   <span
                     className="balance-status"
                     title={
@@ -1306,12 +1352,17 @@ export function App() {
                   passphrase encryption or save without encryption. Clearing
                   browser data removes this wallet.
                 </p>
-                <button className="button dark" onClick={() => open("backup")}>
+                <button
+                  className="button dark"
+                  disabled={!repo}
+                  onClick={() => open("backup")}
+                >
                   <Download size={17} />
                   Export backup
                 </button>
                 <button
                   className="button secondary"
+                  disabled={!repo}
                   onClick={() => open("restore")}
                 >
                   <Upload size={17} />
@@ -1339,6 +1390,13 @@ export function App() {
                     )
                   }
                 />
+                {syncEnabled && (
+                  <SharedWallet
+                    mint={mintUrl}
+                    onSelect={selectRepository}
+                    disabled={busy}
+                  />
+                )}
               </Suspense>
             </div>
           </div>
@@ -1941,6 +1999,10 @@ export function App() {
                 e.preventDefault();
                 run(dialog, async () => {
                   if (dialog === "backup") {
+                    if (!repo)
+                      throw new Error(
+                        "Unlock your Google wallet before exporting",
+                      );
                     const text =
                         backupMode === "plaintext"
                           ? plaintextBackup(await repo.read(), mintUrl)

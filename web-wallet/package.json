@@ -15,7 +15,9 @@
     "preview": "vite preview --host 127.0.0.1",
     "test:e2e:production": "npm run build && WALLET_E2E_PRODUCTION=1 playwright test",
     "format": "prettier --write src \"tests/**/*.ts\" packages/cashu-ts/src/tmp-cash packages/coco/tmp-cash packages/coco-indexeddb/src/tmp-cash *.ts *.json *.md",
-    "format:check": "prettier --check src \"tests/**/*.ts\" packages/cashu-ts/src/tmp-cash packages/coco/tmp-cash packages/coco-indexeddb/src/tmp-cash *.ts *.json *.md"
+    "format:check": "prettier --check src \"tests/**/*.ts\" packages/cashu-ts/src/tmp-cash packages/coco/tmp-cash packages/coco-indexeddb/src/tmp-cash *.ts *.json *.md",
+    "test:sync": "npx --yes firebase-tools@15.35.0 emulators:exec --only firestore --project demo-tmpcash \"vitest run tests/firebase-sync.test.ts\"",
+    "test:sync:browser": "VITE_FIREBASE_API_KEY=demo-public-key VITE_FIREBASE_AUTH_DOMAIN=demo-tmpcash.firebaseapp.com VITE_FIREBASE_PROJECT_ID=demo-tmpcash VITE_FIREBASE_APP_ID=demo-app VITE_FIREBASE_SYNC_ENABLED=true npx --yes firebase-tools@15.35.0 emulators:exec --only firestore,auth --project demo-tmpcash \"playwright test tests/browser/firebase-sync.spec.ts\""
   },
   "dependencies": {
     "@cashu/cashu-ts": "file:packages/cashu-ts",
@@ -31,6 +33,7 @@
     "react-dom": "19.1.1"
   },
   "devDependencies": {
+    "@firebase/rules-unit-testing": "5.0.2",
     "@playwright/test": "1.56.1",
     "@types/node": "22.18.6",
     "@types/qrcode": "1.5.5",

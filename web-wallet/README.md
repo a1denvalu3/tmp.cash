@@ -125,6 +125,9 @@ over HTTPS and use an HTTPS mint; browsers block mixed-content requests.
 - **Google recovery:** optional Google login and automatic Google Drive copies in
   either backup format. See [setup instructions](../docs/google-recovery.md).
   Backups do not coordinate spending between devices.
+- **Shared Google wallet:** optional Firestore transactions coordinate spending
+  and saved-request recovery across devices. See [setup and guarantees](../docs/firebase-concurrency.md).
+  Local wallets stay separate; shared spending requires connectivity.
 - **Debug logs:** in Settings, choose **Copy debug logs** and paste the report
   into your support chat, or choose **Download logs** to share a JSON file.
   A selectable report appears if clipboard access is unavailable. Logs also
