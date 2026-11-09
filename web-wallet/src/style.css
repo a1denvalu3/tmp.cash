@@ -1298,6 +1298,13 @@ input[type="file"] {
   .app-shell .header-tools {
     display: contents;
   }
+  .app-shell .header .backup-entry {
+    grid-column: 1 / -1;
+    justify-self: start;
+    max-width: 100%;
+    min-height: 44px;
+    margin-bottom: 12px;
+  }
   .app-shell .header .theme-toggle {
     grid-column: 2;
     grid-row: 1;
@@ -1846,12 +1853,6 @@ input[type="file"] {
   }
   .backup-setup h2 {
     font-size: 28px;
-  }
-  .backup-entry span {
-    display: none;
-  }
-  .backup-entry {
-    padding: 8px;
   }
   .backup-choice {
     padding: 16px 13px;
