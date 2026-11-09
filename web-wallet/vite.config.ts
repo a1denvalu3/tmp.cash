@@ -56,6 +56,9 @@ export default defineConfig(({ command }) => ({
           new URL("./how-it-works/index.html", import.meta.url),
         ),
         wallet: fileURLToPath(new URL("./wallet/index.html", import.meta.url)),
+        privacy: fileURLToPath(
+          new URL("./privacy/index.html", import.meta.url),
+        ),
       },
     },
   },

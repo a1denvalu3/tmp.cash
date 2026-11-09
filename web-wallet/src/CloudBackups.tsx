@@ -500,7 +500,15 @@ export function useCloudBackups(
             </button>
             <p className="small muted backup-note">
               Nothing is uploaded until you choose your backup protection.
-              Sign-in is optional.
+              Sign-in is optional.{" "}
+              <a
+                href="/privacy/"
+                target="_blank"
+                rel="noreferrer"
+                aria-label="Privacy policy (opens in a new tab)"
+              >
+                Privacy policy
+              </a>
             </p>
           </>
         )}

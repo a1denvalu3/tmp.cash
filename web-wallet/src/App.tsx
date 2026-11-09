@@ -1284,6 +1284,9 @@ export function App() {
         >
           How tmp.cash works <ArrowUpRight size={13} />
         </a>
+        <a className="text-button small wallet-privacy-link" href="/privacy/">
+          Privacy policy
+        </a>
       </footer>
       {cloudBackups.prompt}
       {dialog && (

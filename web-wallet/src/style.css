@@ -1570,7 +1570,8 @@ input[type="file"] {
   padding: 40px;
   color: var(--muted);
 }
-.app-shell footer .wallet-learn-link {
+.app-shell footer .wallet-learn-link,
+.app-shell footer .wallet-privacy-link {
   display: inline-flex;
   min-height: 44px;
   text-decoration: none;
