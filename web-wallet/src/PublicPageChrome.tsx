@@ -10,7 +10,11 @@ export function WalletLink() {
   );
 }
 
-export function PublicPageHeader({ cryptography = false }) {
+export function PublicPageHeader({
+  page = "landing",
+}: {
+  page?: "landing" | "cryptography" | "privacy";
+}) {
   const { theme, changePreference } = useTheme();
   return (
     <header className="header landing-header">
@@ -21,12 +25,12 @@ export function PublicPageHeader({ cryptography = false }) {
         tmp<span>.cash</span>
       </a>
       <nav aria-label="Main navigation">
-        <a href={cryptography ? "/#how-it-works" : "#how-it-works"}>
+        <a href={page === "landing" ? "#how-it-works" : "/#how-it-works"}>
           How it works
         </a>
         <a
           href="/how-it-works/?view=cryptography"
-          aria-current={cryptography ? "page" : undefined}
+          aria-current={page === "cryptography" ? "page" : undefined}
         >
           Cryptography
         </a>
@@ -49,7 +53,7 @@ export function PublicPageHeader({ cryptography = false }) {
   );
 }
 
-export function PublicPageFooter() {
+export function PublicPageFooter({ privacy = false }) {
   return (
     <footer className="landing-footer">
       <span>
@@ -57,6 +61,13 @@ export function PublicPageFooter() {
       </span>
       <a className="text-button" href="/how-it-works/?view=cryptography">
         The cryptography <ArrowUpRight size={13} aria-hidden="true" />
+      </a>
+      <a
+        className="text-button"
+        href="/privacy/"
+        aria-current={privacy ? "page" : undefined}
+      >
+        Privacy policy
       </a>
       <a href="https://github.com/a1denvalu3/tmp.cash" className="text-button">
         <Code2 size={15} aria-hidden="true" /> View the source{" "}

@@ -204,10 +204,10 @@ npm run test:e2e:production
 ```
 
 Build produces a static `dist/` with separate `index.html`,
-`how-it-works/index.html`, and `wallet/index.html`
+`how-it-works/index.html`, `privacy/index.html`, and `wallet/index.html`
 entries, each with a Content Security Policy. Serve the complete directory from
 the same origin so the landing page and wallet share browser preferences and
-existing IndexedDB funds. The `/wallet/` and `/how-it-works/` entries support direct visits and reloads
+existing IndexedDB funds. The `/wallet/`, `/how-it-works/`, and `/privacy/` entries support direct visits and reloads
 without requiring a server-side SPA fallback. `npm test` runs
 cross-language integration tests against a disposable Python mint, including
 private swaps, combined melts, fee change, deadlines, double-spend reservations,
