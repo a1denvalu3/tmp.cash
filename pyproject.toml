@@ -15,7 +15,6 @@ dependencies = [
   "python-dotenv>=1,<2",
   "certifi>=2026.10.19,<2027",
   "sqlalchemy>=2.0,<2.1",
-  "pyjwt[crypto] (>=2.10,<3)",
 ]
 
 [project.optional-dependencies]

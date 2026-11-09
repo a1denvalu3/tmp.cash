@@ -54,6 +54,7 @@ import {
   MAX_BACKUP_LENGTH,
 } from "./backup";
 import { useCloudBackups, UNENCRYPTED_WARNING } from "./CloudBackups";
+import { Modal } from "./Modal";
 import type { TmpCashState } from "coco-cashu-core/tmp-cash";
 import { useTheme } from "./theme";
 import { TmpCashMark } from "./TmpCashMark";
@@ -137,52 +138,6 @@ function deadlineLabel(
     return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m left`;
   }
   return blocks === null ? "Deadline unavailable" : `${blocks} blocks left`;
-}
-function Modal({
-  title,
-  subtitle,
-  children,
-  close,
-}: {
-  title: string;
-  subtitle?: string;
-  children: ReactNode;
-  close: () => void;
-}) {
-  const ref = useRef<HTMLDialogElement>(null);
-  useEffect(() => {
-    const d = ref.current!;
-    d.showModal();
-    return () => d.close();
-  }, []);
-  useEffect(() => {
-    ref.current?.scrollTo(0, 0);
-  }, [title]);
-  return (
-    <dialog
-      ref={ref}
-      className="modal"
-      onCancel={(event) => {
-        event.preventDefault();
-        close();
-      }}
-      onClick={(event) => {
-        if (event.target === ref.current) close();
-      }}
-    >
-      <button
-        className="icon-button modal-close"
-        aria-label="Close dialog"
-        onClick={close}
-      >
-        <X size={20} />
-      </button>
-      <span className="eyebrow">tmp.cash / WALLET</span>
-      <h2>{title}</h2>
-      {subtitle && <p className="muted">{subtitle}</p>}
-      {children}
-    </dialog>
-  );
 }
 function QR({ value }: { value: string }) {
   const [src, setSrc] = useState("");
@@ -295,9 +250,7 @@ export function App() {
     [mintInput, setMintInput] = useState(initialMint);
   const [manager, setManager] = useState<TmpCashManager | null>(null),
     [view, setView] = useState<TmpCashView | null>(null);
-  const [tab, setTab] = useState<"wallet" | "activity" | "settings">(
-      new URLSearchParams(location.search).has("cloud") ? "settings" : "wallet",
-    ),
+  const [tab, setTab] = useState<"wallet" | "activity" | "settings">("wallet"),
     [dialog, setDialog] = useState<Dialog>(null);
   const [selectedActivity, setSelectedActivity] =
     useState<WalletActivity | null>(null);
@@ -332,6 +285,7 @@ export function App() {
       setMintInput(restored.mint);
       setReconnect((n) => n + 1);
     },
+    dialog !== null,
   );
   const busyRef = useRef(false);
   const meltQuoteVersion = useRef(0);
@@ -726,6 +680,7 @@ export function App() {
           ))}
         </nav>
         <div className="header-tools">
+          {cloudBackups.entry}
           <span className="local-tag">
             <span className={`status-dot ${canSpend ? "" : "offline"}`} />
             {connecting
@@ -1289,7 +1244,7 @@ export function App() {
                     </p>
                   )}
               </section>
-              {cloudBackups}
+              {cloudBackups.settings}
               <section className="settings-card">
                 <h2>Keep a copy.</h2>
                 <p className="muted">
@@ -1330,6 +1285,7 @@ export function App() {
           How tmp.cash works <ArrowUpRight size={13} />
         </a>
       </footer>
+      {cloudBackups.prompt}
       {dialog && (
         <Modal
           close={close}

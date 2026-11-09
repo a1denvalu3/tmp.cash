@@ -360,26 +360,3 @@ def test_database_url_selects_postgres_for_configured_stores(monkeypatch, tmp_pa
     monkeypatch.setenv("TMP_CASH_DATABASE_URL", url)
     create_backend(parse_args([]))
     assert locations == [url, url]
-
-
-def test_cloud_login_configuration_mounts_the_same_origin_service(tmp_path):
-    (tmp_path / ".env").write_text(
-        "TMP_CASH_CLOUD_ORIGIN=http://127.0.0.1:5173\n"
-        "TMP_CASH_GOOGLE_CLIENT_ID=test-client\n"
-        "TMP_CASH_GOOGLE_CLIENT_SECRET=test-secret\n"
-    )
-    args = parse_args([])
-    backend = create_backend(args)
-    mint = Mint(tmp_path / "mint.sqlite3", SEED, backend)
-    app = create_app(
-        mint,
-        recovery=False,
-        cloud_config=args.cloud_config,
-        cloud_location=tmp_path / "cloud.sqlite3",
-    )
-    with TestClient(app, base_url="http://127.0.0.1:5173") as client:
-        response = client.get("/api/cloud/status")
-        assert response.status_code == 200
-        assert response.json() == {"providers": ["google"], "user": None}
-        assert response.headers["cache-control"] == "no-store"
-        assert client.get("/v1/info").status_code == 200

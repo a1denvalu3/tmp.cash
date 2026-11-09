@@ -39,7 +39,7 @@ export default defineConfig(({ command }) => ({
                 attrs: {
                   "http-equiv": "Content-Security-Policy",
                   content:
-                    "default-src 'self'; script-src 'self'; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data: blob:; connect-src 'self' http: https:; object-src 'none'; base-uri 'self'; form-action 'none'",
+                    "default-src 'self'; script-src 'self' https://accounts.google.com/gsi/client https://cdn.apple-cloudkit.com/ck/2/cloudkit.js; frame-src https://accounts.google.com https://*.apple-cloudkit.com https://*.icloud.com https://idmsa.apple.com; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data: blob:; connect-src 'self' http: https:; object-src 'none'; base-uri 'self'; form-action 'none'",
                 },
                 injectTo: "head" as const,
               },
@@ -47,20 +47,7 @@ export default defineConfig(({ command }) => ({
           : [],
     },
   ],
-  server: {
-    port: 5173,
-    strictPort: true,
-    proxy: {
-      "/api/cloud":
-        process.env.WALLET_CLOUD_PROXY_TARGET || "http://127.0.0.1:3338",
-    },
-  },
-  preview: {
-    proxy: {
-      "/api/cloud":
-        process.env.WALLET_CLOUD_PROXY_TARGET || "http://127.0.0.1:3338",
-    },
-  },
+  server: { port: 5173, strictPort: true },
   build: {
     rollupOptions: {
       input: {
