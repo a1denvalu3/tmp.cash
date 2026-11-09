@@ -7,6 +7,7 @@ import uvicorn
 from dotenv import dotenv_values
 
 from .api import create_app
+from .cloud import CloudConfig
 from .db import IncompatibleMintDatabase, MintDatabaseInUse
 from .lightning import FakeBackend, HoldInvoiceBackend, LndRestBackend
 from .mint import Mint
@@ -74,6 +75,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--port", type=int, default=configuration.get("TMP_CASH_MINT_PORT") or "3338"
     )
     parser.set_defaults(admin_token=configuration.get("TMP_CASH_ADMIN_TOKEN") or None)
+    try:
+        parser.set_defaults(cloud_config=CloudConfig.from_mapping(configuration))
+    except (ValueError, OSError) as exc:
+        parser.error(str(exc))
     parser.add_argument(
         "--lnd-endpoint", default=configuration.get("TMP_CASH_LND_ENDPOINT")
     )
@@ -253,7 +258,13 @@ def main() -> None:
     if args.backend == "fake" and args.fake_auto_accept:
         print("Fake funding: auto-accept enabled", file=sys.stderr)
     uvicorn.run(
-        create_app(mint, report_balances=True, admin_token=args.admin_token),
+        create_app(
+            mint,
+            report_balances=True,
+            admin_token=args.admin_token,
+            cloud_config=args.cloud_config,
+            cloud_location=args.database_url or args.data / "cloud.sqlite3",
+        ),
         host=args.host,
         port=args.port,
     )

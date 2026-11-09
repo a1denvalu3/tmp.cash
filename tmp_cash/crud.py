@@ -14,6 +14,7 @@ MINT = "tmp_cash_mint"
 FAKE = "tmp_cash_fake"
 SPARK = "tmp_cash_spark"
 WALLET = "tmp_cash_wallet"
+CLOUD = "tmp_cash_cloud"
 
 
 def _metadata(schema: str) -> sa.MetaData:
@@ -217,17 +218,55 @@ WALLET_OPERATION_SOURCES = sa.Table(
     schema=WALLET,
 )
 
+CLOUD_METADATA = _metadata(CLOUD)
+CLOUD_METADATA_TABLE = _metadata_table(CLOUD_METADATA, CLOUD)
+CLOUD_LOGINS = sa.Table(
+    "logins",
+    CLOUD_METADATA,
+    sa.Column("id", sa.Text, primary_key=True),
+    sa.Column("provider", sa.Text, nullable=False),
+    sa.Column("binding", sa.Text, nullable=False),
+    sa.Column("nonce", sa.Text, nullable=False),
+    sa.Column("verifier", sa.Text, nullable=False),
+    sa.Column("expires", sa.BigInteger, nullable=False),
+    schema=CLOUD,
+)
+CLOUD_SESSIONS = sa.Table(
+    "sessions",
+    CLOUD_METADATA,
+    sa.Column("id", sa.Text, primary_key=True),
+    sa.Column("account", sa.Text, nullable=False),
+    sa.Column("provider", sa.Text, nullable=False),
+    sa.Column("label", sa.Text, nullable=False),
+    sa.Column("expires", sa.BigInteger, nullable=False),
+    schema=CLOUD,
+)
+CLOUD_BACKUPS = sa.Table(
+    "backups",
+    CLOUD_METADATA,
+    sa.Column("account", sa.Text, primary_key=True),
+    sa.Column("id", sa.Text, primary_key=True),
+    sa.Column("revision", sa.BigInteger, nullable=False),
+    sa.Column("updated", sa.BigInteger, nullable=False),
+    sa.Column("name", sa.Text, nullable=False),
+    sa.Column("encrypted", sa.Boolean, nullable=False),
+    sa.Column("payload", sa.Text, nullable=False),
+    schema=CLOUD,
+)
+
 STORE_METADATA = {
     MINT: MINT_METADATA,
     FAKE: FAKE_METADATA,
     SPARK: SPARK_METADATA,
     WALLET: WALLET_METADATA,
+    CLOUD: CLOUD_METADATA,
 }
 STORE_METADATA_TABLES = {
     MINT: MINT_METADATA_TABLE,
     FAKE: FAKE_METADATA_TABLE,
     SPARK: SPARK_METADATA_TABLE,
     WALLET: WALLET_METADATA_TABLE,
+    CLOUD: CLOUD_METADATA_TABLE,
 }
 STORE_TABLES = {
     schema: {
@@ -515,6 +554,10 @@ class Crud:
 
     def create_store(self) -> None:
         STORE_METADATA[self.schema].create_all(self.connection, checkfirst=True)
+
+    def cloud_prune_auth(self, now: int) -> None:
+        for table in (CLOUD_LOGINS, CLOUD_SESSIONS):
+            self.connection.execute(table.delete().where(table.c.expires <= now))
 
     def metadata(self) -> dict[str, str]:
         rows = self.select("metadata")

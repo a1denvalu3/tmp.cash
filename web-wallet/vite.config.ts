@@ -47,7 +47,20 @@ export default defineConfig(({ command }) => ({
           : [],
     },
   ],
-  server: { port: 5173, strictPort: true },
+  server: {
+    port: 5173,
+    strictPort: true,
+    proxy: {
+      "/api/cloud":
+        process.env.WALLET_CLOUD_PROXY_TARGET || "http://127.0.0.1:3338",
+    },
+  },
+  preview: {
+    proxy: {
+      "/api/cloud":
+        process.env.WALLET_CLOUD_PROXY_TARGET || "http://127.0.0.1:3338",
+    },
+  },
   build: {
     rollupOptions: {
       input: {

@@ -1575,3 +1575,51 @@ input[type="file"] {
   min-height: 44px;
   text-decoration: none;
 }
+
+.cloud-card {
+  grid-column: 1 / -1;
+}
+.cloud-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 12px 0;
+}
+.cloud-actions .button {
+  margin: 0;
+}
+.cloud-label {
+  overflow-wrap: anywhere;
+}
+.cloud-warning {
+  border: 1px solid #b17529;
+  border-radius: 10px;
+  padding: 14px;
+  margin: 14px 0;
+  font-size: 14px;
+  line-height: 1.6;
+}
+.backup-ack {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+.backup-ack input {
+  width: auto;
+  min-width: 18px;
+  margin-top: 5px;
+}
+.cloud-backups {
+  list-style: none;
+  padding: 0;
+}
+.cloud-backups li {
+  padding: 16px 0;
+  border-bottom: 1px solid var(--line);
+}
+.cloud-backups strong {
+  overflow-wrap: anywhere;
+}
+.cloud-restore {
+  padding: 16px 0;
+}

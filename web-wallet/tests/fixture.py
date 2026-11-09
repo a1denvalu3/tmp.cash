@@ -2,19 +2,28 @@
 
 import argparse
 import hashlib
+import json
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Literal
+from urllib.parse import parse_qs, urlencode
 
+import httpx
+import jwt
 import uvicorn
 from bolt11 import Tag, TagChar, Tags, decode, encode
+from cryptography.hazmat.primitives.asymmetric import rsa
+from fastapi import Request
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from tmp_cash.api import create_app
+from tmp_cash.cloud import ENDPOINTS, CloudConfig, Provider, create_cloud_app
 from tmp_cash.lightning import FakeBackend
 from tmp_cash.mint import Mint
 
@@ -55,6 +64,62 @@ def main():
         )
         mint = Mint(path / "mint.sqlite3", bytes.fromhex("42" * 32), backend)
         app = create_app(mint)
+        # The browser follows a real authorization-code redirect. Only the
+        # external identity provider is simulated; sessions, signatures, backup
+        # storage and all wallet cryptography run through production code.
+        origin = os.environ.get("WALLET_E2E_ORIGIN", "http://127.0.0.1:5173")
+        private = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        jwk = json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(private.public_key()))
+        jwk.update(kid="browser-test-key", alg="RS256")
+        codes = {}
+
+        def identity_provider(request):
+            if request.url.path.endswith("certs"):
+                return httpx.Response(200, json={"keys": [jwk]})
+            code = parse_qs(request.content.decode())["code"][0]
+            return httpx.Response(
+                200,
+                json={
+                    "id_token": jwt.encode(
+                        codes.pop(code),
+                        private,
+                        algorithm="RS256",
+                        headers={"kid": "browser-test-key"},
+                    )
+                },
+            )
+
+        cloud = create_cloud_app(
+            CloudConfig(
+                origin, {"google": Provider("browser-test-client", "test-secret")}
+            ),
+            path / "cloud.sqlite3",
+            transport=httpx.MockTransport(identity_provider),
+        )
+        app.mount("/api/cloud", cloud)
+        ENDPOINTS["google"] = (
+            f"http://127.0.0.1:{args.port}/test/oidc",
+            *ENDPOINTS["google"][1:],
+        )
+
+        @app.get("/test/oidc")
+        async def authorize(request: Request):
+            code = os.urandom(32).hex()
+            now = int(time.time())
+            codes[code] = {
+                "iss": "https://accounts.google.com",
+                "aud": "browser-test-client",
+                "sub": "browser-test-user",
+                "nonce": request.query_params["nonce"],
+                "iat": now,
+                "exp": now + 300,
+                "email": "wallet-test@example.com",
+            }
+            return RedirectResponse(
+                origin
+                + "/api/cloud/callback/google?"
+                + urlencode({"code": code, "state": request.query_params["state"]})
+            )
 
         @app.get("/test/health")
         async def health():

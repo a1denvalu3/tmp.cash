@@ -47,7 +47,14 @@ import {
   type PSLnurlPayRequest,
   type PSMeltQuote,
 } from "@cashu/cashu-ts/tmp-cash";
-import { decryptBackup, encryptBackup, MAX_BACKUP_LENGTH } from "./backup";
+import {
+  restoreBackup,
+  encryptBackup,
+  plaintextBackup,
+  MAX_BACKUP_LENGTH,
+} from "./backup";
+import { useCloudBackups, UNENCRYPTED_WARNING } from "./CloudBackups";
+import type { TmpCashState } from "coco-cashu-core/tmp-cash";
 import { useTheme } from "./theme";
 import { TmpCashMark } from "./TmpCashMark";
 import { expiredBackings } from "./backings";
@@ -288,7 +295,9 @@ export function App() {
     [mintInput, setMintInput] = useState(initialMint);
   const [manager, setManager] = useState<TmpCashManager | null>(null),
     [view, setView] = useState<TmpCashView | null>(null);
-  const [tab, setTab] = useState<"wallet" | "activity" | "settings">("wallet"),
+  const [tab, setTab] = useState<"wallet" | "activity" | "settings">(
+      new URLSearchParams(location.search).has("cloud") ? "settings" : "wallet",
+    ),
     [dialog, setDialog] = useState<Dialog>(null);
   const [selectedActivity, setSelectedActivity] =
     useState<WalletActivity | null>(null);
@@ -309,8 +318,21 @@ export function App() {
   const [funding, setFunding] = useState<TmpCashFunding | null>(null),
     [password, setPassword] = useState(""),
     [backupFile, setBackupFile] = useState<File | null>(null);
+  const [encryptFile, setEncryptFile] = useState(true);
+  const [acknowledgePlain, setAcknowledgePlain] = useState(false);
   const [tick, setTick] = useState(0),
     [reconnect, setReconnect] = useState(0);
+  const cloudBackups = useCloudBackups(
+    repo,
+    mintUrl,
+    async (restored: { mint: string; state: TmpCashState }) => {
+      await repo.importState(restored.state);
+      localStorage.setItem("layer3-mint", restored.mint);
+      setMintUrl(restored.mint);
+      setMintInput(restored.mint);
+      setReconnect((n) => n + 1);
+    },
+  );
   const busyRef = useRef(false);
   const meltQuoteVersion = useRef(0);
   const fundingRef = useRef<TmpCashFunding | null>(null);
@@ -551,6 +573,8 @@ export function App() {
     setFunding(null);
     setPassword("");
     setBackupFile(null);
+    setEncryptFile(true);
+    setAcknowledgePlain(false);
     setDialog(next);
   }
   function close() {
@@ -1265,12 +1289,13 @@ export function App() {
                     </p>
                   )}
               </section>
+              {cloudBackups}
               <section className="settings-card">
                 <h2>Keep a copy.</h2>
                 <p className="muted">
                   Back up your tokens, preimages, and pending operations in a
-                  password-encrypted file. Clearing browser data removes this
-                  wallet.
+                  file. Passphrase encryption is recommended. Clearing browser
+                  data removes this wallet.
                 </p>
                 <button className="button dark" onClick={() => open("backup")}>
                   <Download size={17} />
@@ -1337,8 +1362,8 @@ export function App() {
               receive:
                 "Paste an ecash token. We’ll refresh its proofs before adding it.",
               pay: "Pay an invoice, Lightning address, or LNURL with your ecash.",
-              backup: "Protect this file with a password you can remember.",
-              restore: "Restore an encrypted backup into this empty wallet.",
+              backup: "Choose how to protect this wallet backup.",
+              restore: "Restore a backup into this empty wallet.",
               token:
                 "Share this token with its recipient before the backing deadline.",
               preimage:
@@ -1890,11 +1915,14 @@ export function App() {
                 e.preventDefault();
                 run(dialog, async () => {
                   if (dialog === "backup") {
-                    const text = await encryptBackup(
-                        await repo.read(),
-                        mintUrl,
-                        password,
-                      ),
+                    if (!encryptFile && !acknowledgePlain)
+                      throw new Error(
+                        "Acknowledge the risk of an unencrypted backup first",
+                      );
+                    const state = await repo.read();
+                    const text = encryptFile
+                        ? await encryptBackup(state, mintUrl, password)
+                        : plaintextBackup(state, mintUrl),
                       url = URL.createObjectURL(
                         new Blob([text], { type: "application/json" }),
                       );
@@ -1905,12 +1933,16 @@ export function App() {
                     setTimeout(() => URL.revokeObjectURL(url), 1000);
                     setDialog(null);
                     setPassword("");
-                    setNotice("Encrypted backup downloaded.");
+                    setNotice(
+                      encryptFile
+                        ? "Encrypted backup downloaded."
+                        : "Unencrypted backup downloaded. Keep it private: anyone with this file can spend your funds.",
+                    );
                   } else {
                     if (!backupFile) throw new Error("Choose a backup file");
                     if (backupFile.size > MAX_BACKUP_LENGTH)
                       throw new Error("Backup is too large");
-                    const restored = await decryptBackup(
+                    const restored = await restoreBackup(
                       await backupFile.text(),
                       password,
                     );
@@ -1940,21 +1972,76 @@ export function App() {
                   />
                 </>
               )}
-              <label htmlFor="backup-password">Backup password</label>
-              <input
-                autoFocus={dialog === "backup"}
-                id="backup-password"
-                type="password"
-                minLength={12}
-                required
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                autoComplete={
-                  dialog === "backup" ? "new-password" : "current-password"
+              {dialog === "backup" && (
+                <>
+                  <label htmlFor="file-protection">File protection</label>
+                  <select
+                    id="file-protection"
+                    value={encryptFile ? "encrypted" : "plaintext"}
+                    onChange={(event) => {
+                      setEncryptFile(event.target.value === "encrypted");
+                      setAcknowledgePlain(false);
+                      setPassword("");
+                    }}
+                  >
+                    <option value="encrypted">
+                      Encrypt with a passphrase (recommended)
+                    </option>
+                    <option value="plaintext">
+                      No encryption — no passphrase
+                    </option>
+                  </select>
+                  {!encryptFile && (
+                    <div className="cloud-warning">
+                      <p>{UNENCRYPTED_WARNING}</p>
+                      <label className="backup-ack">
+                        <input
+                          type="checkbox"
+                          required
+                          checked={acknowledgePlain}
+                          onChange={(event) =>
+                            setAcknowledgePlain(event.target.checked)
+                          }
+                        />
+                        I understand that anyone with this file can spend my
+                        funds.
+                      </label>
+                    </div>
+                  )}
+                </>
+              )}
+              {(dialog === "restore" || encryptFile) && (
+                <>
+                  <label htmlFor="backup-password">
+                    Backup password
+                    {dialog === "restore" ? " (encrypted files only)" : ""}
+                  </label>
+                  <input
+                    autoFocus={dialog === "backup"}
+                    id="backup-password"
+                    type="password"
+                    minLength={password ? 12 : undefined}
+                    required={dialog === "backup"}
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    autoComplete={
+                      dialog === "backup" ? "new-password" : "current-password"
+                    }
+                    placeholder={
+                      dialog === "restore"
+                        ? "Leave empty for an unencrypted backup"
+                        : "At least 12 characters"
+                    }
+                  />
+                </>
+              )}
+              <button
+                className="button dark full"
+                disabled={
+                  busy ||
+                  (dialog === "backup" && !encryptFile && !acknowledgePlain)
                 }
-                placeholder="At least 12 characters"
-              />
-              <button className="button dark full" disabled={busy}>
+              >
                 {busy ? (
                   <LoaderCircle className="spinning" size={18} />
                 ) : dialog === "backup" ? (
@@ -1963,7 +2050,9 @@ export function App() {
                   <Upload size={18} />
                 )}
                 {dialog === "backup"
-                  ? "Download encrypted backup"
+                  ? encryptFile
+                    ? "Download encrypted backup"
+                    : "Download unencrypted backup"
                   : "Restore wallet"}
               </button>
               <p className="small muted">

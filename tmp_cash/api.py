@@ -2,6 +2,7 @@ import asyncio
 import logging
 import secrets
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import AsyncIterator
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
@@ -10,6 +11,7 @@ from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from .cache import SuccessfulResponseCache
+from .cloud import CloudConfig, create_cloud_app
 from .db import BackendError, MintError
 from .mint import Mint
 from .models import (
@@ -40,8 +42,11 @@ def create_app(
     recovery: bool = True,
     report_balances: bool = False,
     admin_token: str | None = None,
+    cloud_config: CloudConfig | None = None,
+    cloud_location: Path | str | None = None,
 ) -> FastAPI:
     responses = SuccessfulResponseCache()
+    cloud_service: FastAPI | None = None
 
     async def reconcile():
         while True:
@@ -84,9 +89,16 @@ def create_app(
                 except asyncio.CancelledError:
                     pass
             responses.clear()
+            if cloud_service:
+                cloud_service.state.db.engine.dispose()
             await mint.backend.close()
 
     app = FastAPI(title="tmp.cash", version="0.2.0", lifespan=lifespan)
+    if cloud_config:
+        if cloud_location is None:
+            raise ValueError("Cloud backups require a database location")
+        cloud_service = create_cloud_app(cloud_config, cloud_location)
+        app.mount("/api/cloud", cloud_service)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],

@@ -118,10 +118,27 @@ over HTTPS and use an HTTPS mint; browsers block mixed-content requests.
   encrypted backups. Historical tokens may already be spent or expired; incoming
   tokens were exchanged for fresh proofs. Older entries remain readable and
   clearly indicate details that were not recorded.
-- **Settings:** exports/restores password-encrypted backups containing proofs,
-  backing preimages, pending request secrets, and the outgoing token history.
-  Restore requires an empty wallet in a new browser profile. A snapshot backup
-  cannot recover operations created after it was downloaded.
+- **Settings / Cloud backups:** sign in with Google or Apple, then enable
+  automatic backups. The wallet checks for changes every five seconds while
+  open and saves proofs, backing preimages, pending request secrets, and outgoing
+  token history to this wallet service's server. It retries failed saves, shows
+  the last successful save, and resumes after reload. Uploads are saved locally
+  before sending, so a lost response can be retried after reload without
+  blocking newer backups or replacing a newer server copy. Signing in alone does not
+  upload funds or overwrite a saved wallet. Sign in with the same provider and
+  account on a new browser to find and restore saved wallets.
+- **Backup protection:** passphrase encryption is recommended. Keep the
+  passphrase for recovery on a new device; social sign-in cannot reset it. The
+  browser saves a non-extractable encryption key locally for automatic backups,
+  not the passphrase. Alternatively, explicitly choose **No encryption** and
+  acknowledge that anyone who can access the backup—including the server
+  operator or someone who gets into the account—can read wallet secrets and
+  spend funds. This option permits recovery with social sign-in alone.
+- **Backup files:** exports and restores encrypted or explicitly acknowledged
+  unencrypted files. Existing encrypted backups remain compatible. Restore
+  requires an empty wallet in a new browser profile. A snapshot cannot recover
+  changes made after its last successful save, and no backups extend token
+  deadlines. Use one active copy of a restored wallet to avoid competing spends.
 - **Debug logs:** in Settings, choose **Copy debug logs** and paste the report
   into your support chat, or choose **Download logs** to share a JSON file.
   A selectable report appears if clipboard access is unavailable. Logs also
@@ -220,3 +237,112 @@ fake sats and do not touch `~/cashu-regtest` or an existing mint database.
 The modified libraries are source workspaces under `packages/`; no globally
 installed packages or sibling checkouts are required. See
 [PROVENANCE.md](PROVENANCE.md) for exact upstream revisions and changes.
+
+## Cloud backup setup
+
+Cloud login is opt-in server configuration. It uses Google's and Apple's
+OpenID Connect authorization-code flows. Google uses PKCE; both providers use
+one-time browser-bound state, a nonce, and verified ID-token signatures,
+issuer, audience, and expiry. No identity SDK or third-party script runs in the
+wallet. Provider tokens are discarded after sign-in. Sessions last 30 days and
+use HTTP-only, Secure, SameSite=Lax cookies in production; Apple's short-lived
+login binding cookie uses SameSite=None for its cross-site form POST.
+
+Backups are stored by **this wallet service**, not in Google Drive or iCloud.
+Google and Apple authenticate the user. Accounts are keyed by provider and
+verified subject, never merged by email. Choosing another provider—even with
+the same email—opens a separate backup account.
+
+1. In [Google Cloud Console](https://console.cloud.google.com/), create/select a
+   project. Open **Google Auth Platform**, complete **Branding** with the wallet
+   name, support/contact emails, homepage, and authorized domain, and set
+   **Audience** to External for public users. Add your test account while the
+   app is in Testing. In **Clients → Create client**, choose **Web application**
+   and register `https://YOUR-WALLET/api/cloud/callback/google` as an authorized
+   redirect URI. Copy the generated client ID and client secret into the server
+   environment. Only `openid email` is requested; no Drive permission is needed.
+2. For Apple, configure a primary App ID with Sign in with Apple, a **Services
+   ID** for the website, its domain and return URL
+   `https://YOUR-WALLET/api/cloud/callback/apple`, and a Sign in with Apple `.p8`
+   key. Use an Account Holder or Admin login in
+   [Apple Developer](https://developer.apple.com/account/resources/identifiers/list).
+   Under **Identifiers**, enable Sign in with Apple on the primary App ID, then
+   register a Services ID such as `cash.tmp.wallet.web`. Edit that Services ID,
+   enable Sign in with Apple, select the primary App ID, and enter the wallet
+   domain and return URL. Under **Keys**, create a Sign in with Apple key linked
+   to the same primary App ID and download its `.p8` file. The key page provides
+   the Key ID; **Membership details** provides the Team ID. The server generates
+   short-lived ES256 client secrets from that key automatically.
+
+   Apple's documentation describes web sign-in as accompanying an existing App
+   Store app using Sign in with Apple. If this project is web-only, resolve that
+   prerequisite with Apple before the Apple rollout. See
+   [Apple's environment requirements](https://developer.apple.com/documentation/signinwithapple/configuring-your-environment-for-sign-in-with-apple).
+
+3. Set the root environment values from [.env.example](../.env.example):
+   `TMP_CASH_CLOUD_ORIGIN`, Google client ID/secret, and Apple's Services ID,
+   team ID, key ID, and private key file. The origin must exactly match the
+   wallet's scheme, hostname, and port, without a path. Either provider can be
+   configured on its own. Keep the private key file readable only by the service
+   user and retain it outside the repository. Never put secrets in frontend
+   build variables. Restart the server after configuration changes.
+4. Reverse-proxy **all methods** under `/api/cloud/` from the wallet origin to
+   the mint process. Do not expose it as a credentialed cross-origin API. For
+   Nginx, add a location to the wallet's HTTPS virtual host (no URI rewrite):
+
+   ```nginx
+   location /api/cloud/ {
+       proxy_pass http://127.0.0.1:3338;
+       proxy_set_header Host $host;
+       proxy_set_header X-Forwarded-Proto $scheme;
+       client_max_body_size 32m;
+       proxy_read_timeout 60s;
+       access_log off;
+       add_header Cache-Control no-store always;
+       add_header Referrer-Policy no-referrer always;
+   }
+   ```
+
+   Apply normal per-IP rate limiting to this route and avoid logging callback
+   query strings or request/response bodies in proxies or application tracing.
+   Allow Apple's `application/x-www-form-urlencoded` callback POST. Keep the
+   rest of the existing TLS/security headers on this location. Uvicorn callback
+   logs have their authorization-code query removed by the application.
+
+5. Preserve `cloud.sqlite3` alongside the server data, or use
+   `TMP_CASH_DATABASE_URL` for the separate `tmp_cash_cloud` PostgreSQL schema.
+   SQLite cloud files use mode 0600. Protect database access and server snapshots:
+   unencrypted backups contain spendable wallet secrets. Back up this store
+   regularly to durable storage off the server as part of the deployment's
+   recovery procedure. Each account can save up to ten named wallet copies,
+   each limited to 16 MB; saves atomically replace that copy with a revision
+   check. A new browser creates a separate copy only after explicit enablement.
+   There is no historical version archive. Deleting a cloud copy cannot erase
+   snapshots already retained by the operator.
+
+For local Google testing, set `TMP_CASH_CLOUD_ORIGIN=http://127.0.0.1:5173`,
+register that exact callback URL, and run the mint on port 3338. Vite development
+and preview proxy `/api/cloud` there; override the shell variable
+`WALLET_CLOUD_PROXY_TARGET` if using a different local port. Production static
+hosting requires the reverse proxy above. Apple requires a registered HTTPS
+domain and cannot use this loopback HTTP setup.
+
+Automatic saves require Web Crypto, IndexedDB, and Web Locks. Pausing or signing
+out removes this browser's automatic-backup configuration and saved encryption
+key; server copies remain until deleted. Browser wallet records themselves are
+still stored locally without encryption. With passphrase protection, loss of
+both browser data and passphrase makes that cloud copy unrecoverable. With no
+passphrase, account compromise or server access can expose funds. Closing the
+wallet, an expired sign-in, or a network failure can leave recent changes
+unsaved; check the last-save status before relying on a backup.
+
+The disposable browser fixture simulates Google's authorization/token/JWKS
+endpoints but uses the production sign-in service, real signed ID tokens,
+HTTP-only session cookies, durable backup API, browser key storage, and wallet
+cryptography. Python tests cover Google's and Apple's flows, invalid claims,
+state replay/expiry, CSRF, account separation, revision conflicts, deletion,
+and session revocation. Real-provider acceptance still requires configured
+credentials and a manual login with each provider on the target domain.
+
+Provider references: [Google OpenID Connect](https://developers.google.com/identity/openid-connect/openid-connect),
+[Apple Sign in with Apple REST API](https://developer.apple.com/documentation/signinwithapplerestapi).
