@@ -13,7 +13,7 @@ export function WalletLink() {
 export function PublicPageHeader({
   page = "landing",
 }: {
-  page?: "landing" | "cryptography" | "privacy";
+  page?: "landing" | "cryptography" | "privacy" | "terms";
 }) {
   const { theme, changePreference } = useTheme();
   return (
@@ -53,7 +53,7 @@ export function PublicPageHeader({
   );
 }
 
-export function PublicPageFooter({ privacy = false }) {
+export function PublicPageFooter({ page }: { page?: "privacy" | "terms" }) {
   return (
     <footer className="landing-footer">
       <span>
@@ -65,9 +65,16 @@ export function PublicPageFooter({ privacy = false }) {
       <a
         className="text-button"
         href="/privacy/"
-        aria-current={privacy ? "page" : undefined}
+        aria-current={page === "privacy" ? "page" : undefined}
       >
         Privacy policy
+      </a>
+      <a
+        className="text-button"
+        href="/terms/"
+        aria-current={page === "terms" ? "page" : undefined}
+      >
+        Terms of service
       </a>
       <a href="https://github.com/a1denvalu3/tmp.cash" className="text-button">
         <Code2 size={15} aria-hidden="true" /> View the source{" "}

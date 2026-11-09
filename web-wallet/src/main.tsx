@@ -26,15 +26,21 @@ const Privacy = lazy(() =>
     default: PrivacyPage,
   })),
 );
+const Terms = lazy(() =>
+  import("./TermsPage").then(({ TermsPage }) => ({ default: TermsPage })),
+);
 const root = document.getElementById("root")!;
 const isWallet = root.dataset.page === "wallet";
 const isCryptography = root.dataset.page === "cryptography";
 const isPrivacy = root.dataset.page === "privacy";
+const isTerms = root.dataset.page === "terms";
 if (isWallet) startWalletDiagnostics();
 
 // Some static hosts serve the landing entry before normalizing a directory URL.
 if (
-  ["/wallet", "/how-it-works", "/privacy"].includes(window.location.pathname)
+  ["/wallet", "/how-it-works", "/privacy", "/terms"].includes(
+    window.location.pathname,
+  )
 ) {
   window.location.replace(
     `${window.location.pathname}/${window.location.search}${window.location.hash}`,
@@ -57,6 +63,8 @@ if (
           <Cryptography />
         ) : isPrivacy ? (
           <Privacy />
+        ) : isTerms ? (
+          <Terms />
         ) : (
           <Landing />
         )}

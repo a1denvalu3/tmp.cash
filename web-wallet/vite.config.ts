@@ -59,6 +59,7 @@ export default defineConfig(({ command }) => ({
         privacy: fileURLToPath(
           new URL("./privacy/index.html", import.meta.url),
         ),
+        terms: fileURLToPath(new URL("./terms/index.html", import.meta.url)),
       },
     },
   },

@@ -1,56 +1,56 @@
-.privacy-content {
+.legal-content {
   max-width: 740px;
   margin-inline: auto;
   padding: 64px 0 80px;
 }
-.privacy-heading {
+.legal-heading {
   padding-bottom: 32px;
   border-bottom: 1px solid var(--line);
 }
-.privacy-heading h1 {
+.legal-heading h1 {
   margin: 20px 0;
   font-size: clamp(40px, 6vw, 64px);
   font-weight: 500;
   letter-spacing: -2px;
   line-height: 1.1;
 }
-.privacy-heading .privacy-lead {
+.legal-heading .legal-lead {
   color: var(--ink);
   font-size: 18px;
   line-height: 1.7;
 }
-.privacy-content article > section {
+.legal-content article > section {
   margin-top: 36px;
 }
-.privacy-content h2 {
+.legal-content h2 {
   margin: 0 0 14px;
   font-size: 23px;
   font-weight: 500;
   letter-spacing: -0.5px;
   line-height: 1.35;
 }
-.privacy-content article p {
+.legal-content article p {
   margin: 12px 0;
   color: var(--muted);
   font-size: 15px;
   line-height: 1.85;
 }
-.privacy-content article a {
+.legal-content article a {
   color: var(--ink);
   text-decoration: underline;
   text-underline-offset: 3px;
 }
-.privacy-content article a:hover {
+.legal-content article a:hover {
   color: var(--landing-accent);
 }
 @media (max-width: 600px) {
-  .privacy-content {
+  .legal-content {
     padding-block: 36px 48px;
   }
-  .privacy-heading .privacy-lead {
+  .legal-heading .legal-lead {
     font-size: 16px;
   }
-  .privacy-content h2 {
+  .legal-content h2 {
     font-size: 21px;
   }
 }
