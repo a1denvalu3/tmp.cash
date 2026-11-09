@@ -15,6 +15,7 @@ import httpx
 from bolt11 import Bolt11, MilliSatoshi, Tag, TagChar, Tags, decode, encode
 from pydantic import BaseModel, ConfigDict, Field
 
+from .crud import FAKE
 from .db import BackendError, Database
 from .models import InvoiceState, OperatorFundingRequest, OperatorFundingResponse
 
@@ -120,7 +121,7 @@ class FakeBackend(HoldInvoiceBackend):
 
     def __init__(
         self,
-        path: Path,
+        path: Path | str,
         fee_msat: int = 0,
         fee_limit_sat: int = 10,
         *,
@@ -135,30 +136,10 @@ class FakeBackend(HoldInvoiceBackend):
         if type(auto_accept) is not bool:
             raise ValueError("fake auto-accept must be a boolean")
         self.auto_accept = auto_accept
-        self.db = Database(path)
-        with self.db.read() as conn:
-            conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS invoices (
-                    payment_hash TEXT PRIMARY KEY, amount INTEGER NOT NULL,
-                    request TEXT NOT NULL, expiry INTEGER NOT NULL,
-                    state TEXT NOT NULL, amount_paid INTEGER NOT NULL DEFAULT 0
-                );
-                CREATE TABLE IF NOT EXISTS receivers (
-                    request TEXT PRIMARY KEY, payment_hash TEXT NOT NULL,
-                    amount INTEGER NOT NULL, preimage BLOB NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS payments (
-                    payment_hash TEXT PRIMARY KEY, state TEXT NOT NULL,
-                    preimage BLOB
-                );
-                """
-            )
-            columns = {r["name"] for r in conn.execute("PRAGMA table_info(payments)")}
-            if "fee_msat" not in columns:
-                conn.execute(
-                    "ALTER TABLE payments ADD COLUMN fee_msat INTEGER NOT NULL DEFAULT 0"
-                )
+        self.db = Database(path, FAKE)
+        with self.db.transaction() as db:
+            db.create_store()
+            db.migrate_fake()
 
     @staticmethod
     def _invoice(amount: int, payment_hash: str, expiry: int, memo: str) -> str:
@@ -202,54 +183,36 @@ class FakeBackend(HoldInvoiceBackend):
         self, amount: int, payment_hash: str, expiry: int
     ) -> Invoice:
         with self.db.transaction() as conn:
-            row = conn.execute(
-                "SELECT amount FROM invoices WHERE payment_hash=?", (payment_hash,)
-            ).fetchone()
+            row = conn.get("invoices", columns=("amount",), payment_hash=payment_hash)
             if row is not None and row["amount"] != amount:
                 raise BackendError("payment hash already has another invoice amount")
             if row is None:
                 request = self._invoice(amount, payment_hash, expiry, "tmp.cash hold")
-                conn.execute(
-                    "INSERT INTO invoices VALUES (?,?,?,?,?,0)",
-                    (
-                        payment_hash,
-                        amount,
-                        request,
-                        int(time.time()) + expiry,
-                        InvoiceState.open.value,
-                    ),
+                conn.insert(
+                    "invoices",
+                    {
+                        "payment_hash": payment_hash,
+                        "amount": amount,
+                        "request": request,
+                        "expiry": int(time.time()) + expiry,
+                        "state": InvoiceState.open.value,
+                        "amount_paid": 0,
+                    },
                 )
         return await self.get_invoice(payment_hash)
 
     async def get_invoice(self, payment_hash: str) -> Invoice:
         with self.db.transaction() as conn:
-            conn.execute(
-                "UPDATE invoices SET state=? WHERE payment_hash=? AND expiry<=? "
-                "AND state IN (?,?)",
-                (
-                    InvoiceState.canceled.value,
-                    payment_hash,
-                    int(time.time()),
-                    InvoiceState.open.value,
-                    InvoiceState.accepted.value,
-                ),
+            conn.fake_expire_invoice(
+                payment_hash,
+                int(time.time()),
+                (InvoiceState.open.value, InvoiceState.accepted.value),
             )
             if self.auto_accept:
                 # Keep the normal ACCEPTED hold lifecycle. Terminal invoices
                 # stay closed, including invoices expired by the query above.
-                conn.execute(
-                    "UPDATE invoices SET state=?,amount_paid=amount "
-                    "WHERE payment_hash=? AND state=? AND expiry>?",
-                    (
-                        InvoiceState.accepted.value,
-                        payment_hash,
-                        InvoiceState.open.value,
-                        int(time.time()),
-                    ),
-                )
-            row = conn.execute(
-                "SELECT * FROM invoices WHERE payment_hash=?", (payment_hash,)
-            ).fetchone()
+                conn.fake_accept_open_invoice(payment_hash, int(time.time()))
+            row = conn.get("invoices", payment_hash=payment_hash)
         if row is None:
             raise BackendError("unknown hold invoice")
         return Invoice(
@@ -272,26 +235,24 @@ class FakeBackend(HoldInvoiceBackend):
         if invoice.state != InvoiceState.open:
             raise BackendError("invoice is not open")
         with self.db.transaction() as conn:
-            conn.execute(
-                "UPDATE invoices SET state=?,amount_paid=amount WHERE payment_hash=?",
-                (InvoiceState.accepted.value, payment_hash),
-            )
+            conn.fake_accept_open_invoice(payment_hash, int(time.time()))
 
     async def cancel(self, payment_hash: str) -> None:
         invoice = await self.get_invoice(payment_hash)
         if invoice.state == InvoiceState.settled:
             raise BackendError("invoice already settled")
         with self.db.transaction() as conn:
-            conn.execute(
-                "UPDATE invoices SET state=? WHERE payment_hash=?",
-                (InvoiceState.canceled.value, payment_hash),
+            conn.update(
+                "invoices",
+                {"state": InvoiceState.canceled.value},
+                payment_hash=payment_hash,
             )
 
     async def prune_invoice(self, payment_hash: str) -> bool:
         with self.db.read() as conn:
-            row = conn.execute(
-                "SELECT 1 FROM invoices WHERE payment_hash=?", (payment_hash,)
-            ).fetchone()
+            row = conn.get(
+                "invoices", columns=("payment_hash",), payment_hash=payment_hash
+            )
         if row is None:
             return True
         invoice = await self.get_invoice(payment_hash)
@@ -303,16 +264,7 @@ class FakeBackend(HoldInvoiceBackend):
         ):
             return False
         with self.db.transaction() as conn:
-            deleted = conn.execute(
-                "DELETE FROM invoices WHERE payment_hash=? AND expiry<=? "
-                "AND amount_paid=0 AND state IN (?,?)",
-                (
-                    payment_hash,
-                    now,
-                    InvoiceState.open.value,
-                    InvoiceState.canceled.value,
-                ),
-            )
+            deleted = conn.fake_prune_invoice(payment_hash, now)
         return deleted.rowcount == 1
 
     def receiver_invoice(
@@ -328,9 +280,14 @@ class FakeBackend(HoldInvoiceBackend):
         payment_hash = hashlib.sha256(preimage).hexdigest()
         request = self._invoice(amount, payment_hash, expiry, description)
         with self.db.transaction() as conn:
-            conn.execute(
-                "INSERT INTO receivers VALUES (?,?,?,?)",
-                (request, payment_hash, amount, preimage),
+            conn.insert(
+                "receivers",
+                {
+                    "request": request,
+                    "payment_hash": payment_hash,
+                    "amount": amount,
+                    "preimage": preimage,
+                },
             )
         return request
 
@@ -342,9 +299,10 @@ class FakeBackend(HoldInvoiceBackend):
         if invoice.state != InvoiceState.accepted:
             raise BackendError("hold invoice is not accepted")
         with self.db.transaction() as conn:
-            conn.execute(
-                "UPDATE invoices SET state=? WHERE payment_hash=?",
-                (InvoiceState.settled.value, payment_hash),
+            conn.update(
+                "invoices",
+                {"state": InvoiceState.settled.value},
+                payment_hash=payment_hash,
             )
 
     async def pay_invoice(
@@ -357,9 +315,7 @@ class FakeBackend(HoldInvoiceBackend):
     ) -> Payment:
         payment_hash, _ = invoice_details(request)
         with self.db.transaction() as conn:
-            previous = conn.execute(
-                "SELECT * FROM payments WHERE payment_hash=?", (payment_hash,)
-            ).fetchone()
+            previous = conn.get("payments", payment_hash=payment_hash)
             if previous is not None:
                 return Payment(
                     PaymentState(previous["state"]),
@@ -373,23 +329,24 @@ class FakeBackend(HoldInvoiceBackend):
             )
             if self.fee_msat > limit * 1000:
                 return Payment(PaymentState.failed)
-            receiver = conn.execute(
-                "SELECT preimage FROM receivers WHERE request=?", (request,)
-            ).fetchone()
+            receiver = conn.get("receivers", columns=("preimage",), request=request)
             if receiver is None:
                 return Payment(PaymentState.failed)
             preimage = bytes(receiver["preimage"])
-            conn.execute(
-                "INSERT INTO payments VALUES (?,?,?,?)",
-                (payment_hash, PaymentState.succeeded.value, preimage, self.fee_msat),
+            conn.insert(
+                "payments",
+                {
+                    "payment_hash": payment_hash,
+                    "state": PaymentState.succeeded.value,
+                    "preimage": preimage,
+                    "fee_msat": self.fee_msat,
+                },
             )
         return Payment(PaymentState.succeeded, preimage, self.fee_msat)
 
     async def get_payment(self, payment_hash: str) -> Payment | None:
         with self.db.read() as conn:
-            row = conn.execute(
-                "SELECT * FROM payments WHERE payment_hash=?", (payment_hash,)
-            ).fetchone()
+            row = conn.get("payments", payment_hash=payment_hash)
         if row is None:
             return None
         return Payment(PaymentState(row["state"]), row["preimage"], row["fee_msat"])

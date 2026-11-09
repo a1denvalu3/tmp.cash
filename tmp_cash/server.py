@@ -52,6 +52,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=configuration.get("TMP_CASH_MINT_DATA") or "data/mint-v3",
     )
     parser.add_argument(
+        "--database-url",
+        default=configuration.get("TMP_CASH_DATABASE_URL") or None,
+        help="PostgreSQL URL for all application stores (default: SQLite files)",
+    )
+    parser.add_argument(
         "--backend",
         choices=["fake", "lnd", "spark"],
         default=configuration.get("TMP_CASH_MINT_BACKEND") or "fake",
@@ -202,15 +207,16 @@ def create_backend(args: argparse.Namespace) -> HoldInvoiceBackend:
             load_connection(args.spark_config_file) if args.spark_config_file else None
         )
         return SparkBackend(
-            args.data / "spark.sqlite3",
+            args.database_url or args.data / "spark.sqlite3",
             mnemonic,
             args.spark_network,
             args.spark_api_key,
             args.fee_limit_sat,
             connection,
+            storage_dir=args.data / "spark-sdk",
         )
     return FakeBackend(
-        args.data / "fake.sqlite3",
+        args.database_url or args.data / "fake.sqlite3",
         fee_limit_sat=args.fee_limit_sat,
         auto_accept=args.fake_auto_accept,
     )
@@ -220,9 +226,11 @@ def main() -> None:
     args = parse_args()
     backend = create_backend(args)
     seed = load_seed(args.data / "mint.seed")
+    location = args.database_url or args.data / "mint.sqlite3"
+    label = "PostgreSQL database" if args.database_url else str(location)
     try:
         mint = Mint(
-            args.data / "mint.sqlite3",
+            location,
             seed,
             backend,
             args.settle_margin_blocks,
@@ -230,13 +238,13 @@ def main() -> None:
         )
     except MintDatabaseInUse as exc:
         raise SystemExit(
-            f"Cannot open {args.data / 'mint.sqlite3'}: {exc}.\n"
+            f"Cannot open {label}: {exc}.\n"
             "Only one mint process may use this database; stop the other "
             "mint process before starting this one."
         ) from None
     except IncompatibleMintDatabase as exc:
         raise SystemExit(
-            f"Cannot open {args.data / 'mint.sqlite3'}: {exc}.\n"
+            f"Cannot open {label}: {exc}.\n"
             "Set TMP_CASH_MINT_DATA in .env to a new v3 directory, "
             "or pass --data <new-directory>.\n"
             "The existing database and seed must be retained for the old protocol."

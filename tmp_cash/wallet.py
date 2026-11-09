@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 
 from .client import Client, ClientError, MeltOperation, MintOperation, SwapOperation
+from .crud import WALLET
 from .db import Database
 from .keyset import denominations
 from .models import MeltResponse, Token, preimage_hash
@@ -13,53 +14,23 @@ Operation = MintOperation | SwapOperation | MeltOperation
 
 
 class Wallet:
-    def __init__(self, path: Path):
-        self.db = Database(path)
-        os.chmod(path, 0o600)
-        with self.db.transaction() as conn:
-            conn.execute(
-                "CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
-            )
-            protocol = conn.execute(
-                "SELECT value FROM metadata WHERE key='protocol'"
-            ).fetchone()
-            tables = {
-                r[0]
-                for r in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'"
-                )
-            }
-            if (protocol is not None and protocol[0] != "ps-wallet-v3") or (
+    def __init__(self, path: Path | str):
+        self.db = Database(path, WALLET)
+        if self.db.path is not None:
+            os.chmod(self.db.path, 0o600)
+        with self.db.transaction() as db:
+            db.create_metadata()
+            protocol = db.metadata_value("protocol")
+            tables = db.table_names()
+            if (protocol is not None and protocol != "ps-wallet-v3") or (
                 protocol is None and "tokens" in tables
             ):
                 raise ValueError(
                     "wallet database uses a previous protocol; use a new v3 wallet"
                 )
-            conn.execute(
-                "INSERT OR IGNORE INTO metadata VALUES ('protocol','ps-wallet-v3')"
-            )
-            conn.execute(
-                "CREATE TABLE IF NOT EXISTS tokens (id TEXT PRIMARY KEY, token TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'LIVE', expired_state TEXT)"
-            )
-            conn.execute(
-                "CREATE TABLE IF NOT EXISTS operations (id TEXT PRIMARY KEY, kind TEXT NOT NULL, payload TEXT NOT NULL, attempted INTEGER NOT NULL DEFAULT 0, send_amount INTEGER)"
-            )
-            conn.execute(
-                "CREATE TABLE IF NOT EXISTS operation_sources (source TEXT PRIMARY KEY REFERENCES tokens(id), operation TEXT NOT NULL REFERENCES operations(id) ON DELETE CASCADE, original_state TEXT)"
-            )
-            for table, column, definition in (
-                ("tokens", "expired_state", "TEXT"),
-                # Old saved operations may already have reached the mint.
-                ("operations", "attempted", "INTEGER NOT NULL DEFAULT 1"),
-                ("operations", "send_amount", "INTEGER"),
-                ("operation_sources", "original_state", "TEXT"),
-            ):
-                if column not in {
-                    r[1] for r in conn.execute(f"PRAGMA table_info({table})")
-                }:
-                    conn.execute(
-                        f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
-                    )
+            db.set_metadata("protocol", "ps-wallet-v3")
+            db.create_store()
+            db.migrate_wallet()
 
     def save(self, operation: Operation, send_amount: int | None = None):
         with self.db.transaction() as conn:
@@ -82,9 +53,9 @@ class Wallet:
             != denominations(send_amount)
         ):
             raise ValueError("invalid split-send operation")
-        previous = conn.execute(
-            "SELECT payload,send_amount FROM operations WHERE id=?", (operation.id,)
-        ).fetchone()
+        previous = conn.get(
+            "operations", columns=("payload", "send_amount"), id=operation.id
+        )
         if previous:
             if previous[0] != operation.model_dump_json() or previous[1] != send_amount:
                 raise ValueError("operation id already belongs to another request")
@@ -92,50 +63,53 @@ class Wallet:
         if isinstance(operation, MintOperation) and any(
             MintOperation.model_validate_json(row[0]).quote.quote
             == operation.quote.quote
-            for row in conn.execute("SELECT payload FROM operations WHERE kind='mint'")
+            for row in conn.select("operations", columns=("payload",), kind="mint")
         ):
             raise ValueError(
                 "mint quote already has a saved recovery request; retry it"
             )
-        conn.execute(
-            "INSERT INTO operations (id,kind,payload,attempted,send_amount) VALUES (?,?,?,0,?)",
-            (
-                operation.id,
-                operation.kind,
-                operation.model_dump_json(),
-                send_amount,
-            ),
+        conn.insert(
+            "operations",
+            {
+                "id": operation.id,
+                "kind": operation.kind,
+                "payload": operation.model_dump_json(),
+                "attempted": 0,
+                "send_amount": send_amount,
+            },
         )
         if operation.kind != "mint":
             for proof in operation.token.proofs:
                 source = Client.nullifier(proof)
-                row = conn.execute(
-                    "SELECT state FROM tokens WHERE id=?", (source,)
-                ).fetchone()
+                row = conn.get("tokens", columns=("state",), id=source)
                 allowed = {"LIVE", "SENT"} if operation.kind == "swap" else {"LIVE"}
                 if row is not None and row[0] not in allowed:
                     raise ValueError(
                         "token is already spent or has a pending operation"
                     )
                 token = Token(mint=operation.token.mint, proofs=[proof])
-                conn.execute(
-                    "INSERT OR IGNORE INTO tokens (id,token,state) VALUES (?,?,'LIVE')",
-                    (source, token.model_dump_json()),
+                conn.insert(
+                    "tokens",
+                    {"id": source, "token": token.model_dump_json(), "state": "LIVE"},
+                    ignore=True,
                 )
-                conn.execute(
-                    "INSERT INTO operation_sources VALUES (?,?,?)",
-                    (source, operation.id, "LIVE" if row is None else row[0]),
+                conn.insert(
+                    "operation_sources",
+                    {
+                        "source": source,
+                        "operation": operation.id,
+                        "original_state": "LIVE" if row is None else row[0],
+                    },
                 )
-                conn.execute(
-                    "UPDATE tokens SET state='PENDING',token=? WHERE id=?",
-                    (token.model_dump_json(), source),
+                conn.update(
+                    "tokens",
+                    {"state": "PENDING", "token": token.model_dump_json()},
+                    id=source,
                 )
 
     def operation(self, operation_id: str) -> Operation:
         with self.db.read() as conn:
-            row = conn.execute(
-                "SELECT * FROM operations WHERE id=?", (operation_id,)
-            ).fetchone()
+            row = conn.get("operations", id=operation_id)
         if row is None:
             raise ValueError("unknown pending operation")
         if row["kind"] == "mint":
@@ -147,10 +121,8 @@ class Wallet:
     def pending_mint(self, quote_id: str) -> MintOperation | None:
         with self.db.read() as conn:
             operations = [
-                MintOperation.model_validate_json(r[0])
-                for r in conn.execute(
-                    "SELECT payload FROM operations WHERE kind='mint'"
-                )
+                MintOperation.model_validate_json(row[0])
+                for row in conn.select("operations", columns=("payload",), kind="mint")
             ]
         matches = [o for o in operations if o.quote.quote == quote_id]
         if len(matches) > 1:
@@ -169,21 +141,25 @@ class Wallet:
             operation.model_dump() | {"preimage": preimage}
         )
         with self.db.transaction() as conn:
-            conn.execute(
-                "UPDATE operations SET payload=? WHERE id=?",
-                (operation.model_dump_json(), operation_id),
+            conn.update(
+                "operations",
+                {"payload": operation.model_dump_json()},
+                id=operation_id,
             )
         return operation
 
     def pending(self) -> list[dict]:
         with self.db.read() as conn:
-            return [dict(r) for r in conn.execute("SELECT id,kind FROM operations")]
+            return [
+                dict(row._mapping)
+                for row in conn.select("operations", columns=("id", "kind"))
+            ]
 
     def complete(self, operation_id: str, token: Token | None) -> Token | None:
         with self.db.transaction() as conn:
-            operation = conn.execute(
-                "SELECT send_amount FROM operations WHERE id=?", (operation_id,)
-            ).fetchone()
+            operation = conn.get(
+                "operations", columns=("send_amount",), id=operation_id
+            )
             if operation is None:
                 raise ValueError("unknown pending operation")
             outgoing = None
@@ -197,22 +173,19 @@ class Wallet:
                 ):
                     raise ValueError("split-send outputs do not match the saved intent")
                 outgoing = Token(mint=token.mint, proofs=token.proofs[:sent_count])
-            conn.execute(
-                "UPDATE tokens SET state='SPENT' WHERE id IN (SELECT source FROM operation_sources WHERE operation=?)",
-                (operation_id,),
-            )
+            conn.wallet_spend_sources(operation_id)
             if token:
                 for index, proof in enumerate(token.proofs):
                     single = Token(mint=token.mint, proofs=[proof])
-                    conn.execute(
-                        "INSERT INTO tokens (id,token,state) VALUES (?,?,?)",
-                        (
-                            Client.nullifier(proof),
-                            single.model_dump_json(),
-                            "SENT" if index < sent_count else "LIVE",
-                        ),
+                    conn.insert(
+                        "tokens",
+                        {
+                            "id": Client.nullifier(proof),
+                            "token": single.model_dump_json(),
+                            "state": "SENT" if index < sent_count else "LIVE",
+                        },
                     )
-            conn.execute("DELETE FROM operations WHERE id=?", (operation_id,))
+            conn.delete("operations", id=operation_id)
             return outgoing
 
     def retry(
@@ -227,9 +200,11 @@ class Wallet:
         ):
             raise ValueError("operation belongs to another mint")
         with self.db.transaction() as conn:
-            updated = conn.execute(
-                "UPDATE operations SET attempted=1 WHERE id=? AND payload=?",
-                (operation_id, operation.model_dump_json()),
+            updated = conn.update(
+                "operations",
+                {"attempted": 1},
+                id=operation_id,
+                payload=operation.model_dump_json(),
             )
             if updated.rowcount != 1:
                 raise ValueError("pending operation changed; reload before retrying")
@@ -293,52 +268,58 @@ class Wallet:
     def _expire_operation(self, operation_id: str):
         """Clear a terminally failed melt and mark its inputs locally expired."""
         with self.db.transaction() as conn:
-            operation = conn.execute(
-                "SELECT kind FROM operations WHERE id=?", (operation_id,)
-            ).fetchone()
+            operation = conn.get("operations", columns=("kind",), id=operation_id)
             if operation is None:
                 raise ValueError("unknown pending operation")
             if operation["kind"] != "melt":
                 raise ValueError("only melt operations can expire terminally")
-            for source in conn.execute(
-                "SELECT source,original_state FROM operation_sources WHERE operation=?",
-                (operation_id,),
-            ).fetchall():
-                conn.execute(
-                    "UPDATE tokens SET state='EXPIRED',expired_state=? WHERE id=? AND state='PENDING'",
-                    (source["original_state"] or "LIVE", source["source"]),
+            for source in conn.select(
+                "operation_sources",
+                columns=("source", "original_state"),
+                operation=operation_id,
+            ):
+                conn.update(
+                    "tokens",
+                    {
+                        "state": "EXPIRED",
+                        "expired_state": source["original_state"] or "LIVE",
+                    },
+                    id=source["source"],
+                    state="PENDING",
                 )
-            conn.execute("DELETE FROM operations WHERE id=?", (operation_id,))
+            conn.delete("operations", id=operation_id)
 
     def _release_operation(self, operation_id: str, require_unsubmitted: bool = False):
         with self.db.transaction() as conn:
-            operation = conn.execute(
-                "SELECT kind,attempted FROM operations WHERE id=?", (operation_id,)
-            ).fetchone()
+            operation = conn.get(
+                "operations", columns=("kind", "attempted"), id=operation_id
+            )
             if operation is None:
                 raise ValueError("unknown pending operation")
             if require_unsubmitted and operation["attempted"]:
                 raise ValueError(
                     "operation was submitted; retry it to preserve recovery secrets"
                 )
-            for source in conn.execute(
-                "SELECT source,original_state FROM operation_sources WHERE operation=?",
-                (operation_id,),
-            ).fetchall():
+            for source in conn.select(
+                "operation_sources",
+                columns=("source", "original_state"),
+                operation=operation_id,
+            ):
                 # Legacy operations lost their original LIVE/SENT distinction.
-                conn.execute(
-                    "UPDATE tokens SET state=? WHERE id=? AND state='PENDING'",
-                    (
-                        source["original_state"]
-                        or ("LIVE" if operation["kind"] == "melt" else "SENT"),
-                        source["source"],
-                    ),
+                conn.update(
+                    "tokens",
+                    {
+                        "state": source["original_state"]
+                        or ("LIVE" if operation["kind"] == "melt" else "SENT")
+                    },
+                    id=source["source"],
+                    state="PENDING",
                 )
-            conn.execute("DELETE FROM operations WHERE id=?", (operation_id,))
+            conn.delete("operations", id=operation_id)
 
     def tokens(self) -> list[dict]:
         with self.db.read() as conn:
-            rows = conn.execute("SELECT * FROM tokens ORDER BY rowid").fetchall()
+            rows = conn.select("tokens", order_by="rowid")
         return [
             {
                 "id": row["id"],
@@ -354,9 +335,7 @@ class Wallet:
 
     def token(self, token_id: str, state: str = "LIVE") -> Token:
         with self.db.read() as conn:
-            row = conn.execute(
-                "SELECT token FROM tokens WHERE id=? AND state=?", (token_id, state)
-            ).fetchone()
+            row = conn.get("tokens", columns=("token",), id=token_id, state=state)
         if row is None:
             raise ValueError("unknown token or token is not available")
         return Token.model_validate_json(row[0])
@@ -390,9 +369,9 @@ class Wallet:
     def refresh(self, client: Client):
         with self.db.read() as conn:
             candidates = [
-                dict(row)
-                for row in conn.execute(
-                    "SELECT * FROM tokens WHERE state IN ('LIVE','SENT','EXPIRED')"
+                dict(row._mapping)
+                for row in conn.select(
+                    "tokens", in_={"state": ("LIVE", "SENT", "EXPIRED")}
                 )
                 if Token.model_validate_json(row["token"]).mint.rstrip("/")
                 == client.mint_url
@@ -428,10 +407,7 @@ class Wallet:
                         )
                     )
         with self.db.transaction() as conn:
-            conn.executemany(
-                "UPDATE tokens SET state=?,expired_state=? WHERE id=? AND state=? AND token=?",
-                changes,
-            )
+            conn.wallet_refresh(changes)
 
     def send(
         self,
@@ -492,9 +468,11 @@ class Wallet:
         with self.db.transaction() as conn:
             for proof in token.proofs:
                 single = Token(mint=token.mint, proofs=[proof])
-                updated = conn.execute(
-                    "UPDATE tokens SET state='SENT',token=? WHERE id=? AND state='LIVE'",
-                    (single.model_dump_json(), Client.nullifier(proof)),
+                updated = conn.update(
+                    "tokens",
+                    {"state": "SENT", "token": single.model_dump_json()},
+                    id=Client.nullifier(proof),
+                    state="LIVE",
                 )
                 if updated.rowcount != 1:
                     raise ValueError("token is already sent or has a pending operation")
