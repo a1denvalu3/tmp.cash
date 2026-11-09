@@ -17,7 +17,7 @@ def test_no_public_full_listing(service):
     assert service.client.http.get("/v1/htlcs/pending").status_code == 404
     assert service.client.http.post("/v1/htlcs/pending").status_code == 404
     assert service.client.http.get(ENDPOINT).status_code == 405
-    assert service.client.http.get("/v1/info").json()["pending_htlcs"] == ENDPOINT
+    assert "pending_htlcs" not in service.client.http.get("/v1/info").json()
 
 
 @pytest.mark.parametrize(
