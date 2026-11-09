@@ -306,6 +306,105 @@ def test_expired_melt_quotes_pruned_only_without_recovery_records(service):
     assert gated not in remaining()
 
 
+def test_expired_mint_quotes_pruned_only_without_recovery_value(service):
+    expired = [
+        service.client.quote(16, preimage_hash(os.urandom(32).hex()), expiry=60)
+        for _ in range(12)
+    ]
+    accepted = service.client.quote(16, preimage_hash(os.urandom(32).hex()), expiry=60)
+    asyncio.run(service.backend.accept(accepted.payment_hash))
+    live = service.client.quote(16, preimage_hash(os.urandom(32).hex()))
+    issued, _ = service.fund(16, os.urandom(32))
+    past = int(time.time()) - 1
+
+    with service.mint.db.transaction() as conn:
+        for quote in expired + [accepted]:
+            conn.execute(
+                "UPDATE quotes SET expiry=? WHERE quote=?", (past, quote.quote)
+            )
+        conn.execute(
+            "UPDATE quotes SET expiry=? WHERE payment_hash=?",
+            (past, issued.payment_hash),
+        )
+    with service.backend.db.transaction() as conn:
+        for quote in expired + [accepted]:
+            conn.execute(
+                "UPDATE invoices SET expiry=? WHERE payment_hash=?",
+                (past, quote.payment_hash),
+            )
+        conn.execute(
+            "UPDATE invoices SET expiry=? WHERE payment_hash=?",
+            (past, issued.payment_hash),
+        )
+
+    asyncio.run(service.mint.resume_pending_melts())
+
+    def remaining(db):
+        with db.read() as conn:
+            return {row[0] for row in conn.execute("SELECT payment_hash FROM quotes")}
+
+    mint_remaining = remaining(service.mint.db)
+    with service.backend.db.read() as conn:
+        backend_remaining = {
+            row[0] for row in conn.execute("SELECT payment_hash FROM invoices")
+        }
+    assert {quote.payment_hash for quote in expired}.isdisjoint(mint_remaining)
+    assert {quote.payment_hash for quote in expired}.isdisjoint(backend_remaining)
+    retained = {accepted.payment_hash, live.payment_hash, issued.payment_hash}
+    assert retained <= mint_remaining
+    assert retained <= backend_remaining
+
+    gated = service.client.quote(16, preimage_hash(os.urandom(32).hex()), expiry=60)
+    with service.mint.db.transaction() as conn:
+        conn.execute("UPDATE quotes SET expiry=? WHERE quote=?", (past, gated.quote))
+    with service.backend.db.transaction() as conn:
+        conn.execute(
+            "UPDATE invoices SET expiry=? WHERE payment_hash=?",
+            (past, gated.payment_hash),
+        )
+    asyncio.run(service.mint._prune_mint_quotes())
+    assert gated.payment_hash in remaining(service.mint.db)
+    service.mint._last_mint_prune = 0
+    asyncio.run(service.mint._prune_mint_quotes())
+    assert gated.payment_hash not in remaining(service.mint.db)
+
+
+def test_mint_prune_failure_preserves_quote_and_isolates_other_rows(
+    service, monkeypatch
+):
+    failing = service.client.quote(16, preimage_hash(os.urandom(32).hex()), expiry=60)
+    cleaned = service.client.quote(16, preimage_hash(os.urandom(32).hex()), expiry=60)
+    past = int(time.time()) - 1
+    with service.mint.db.transaction() as conn:
+        for quote in (failing, cleaned):
+            conn.execute(
+                "UPDATE quotes SET expiry=? WHERE quote=?", (past, quote.quote)
+            )
+    with service.backend.db.transaction() as conn:
+        for quote in (failing, cleaned):
+            conn.execute(
+                "UPDATE invoices SET expiry=? WHERE payment_hash=?",
+                (past, quote.payment_hash),
+            )
+    original = service.backend.prune_invoice
+
+    async def unreliable(payment_hash):
+        if payment_hash == failing.payment_hash:
+            raise RuntimeError("backend unavailable")
+        return await original(payment_hash)
+
+    monkeypatch.setattr(service.backend, "prune_invoice", unreliable)
+    asyncio.run(service.mint._prune_mint_quotes())
+    with service.mint.db.read() as conn:
+        remaining = {row[0] for row in conn.execute("SELECT payment_hash FROM quotes")}
+    assert failing.payment_hash in remaining
+    assert cleaned.payment_hash not in remaining
+    with service.backend.db.read() as conn:
+        assert conn.execute(
+            "SELECT 1 FROM invoices WHERE payment_hash=?", (failing.payment_hash,)
+        ).fetchone()
+
+
 def test_keyed_lock_cancelled_waiter_does_not_leak_references(service):
     async def exercise():
         locks = service.mint._hold_locks

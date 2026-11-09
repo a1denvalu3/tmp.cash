@@ -69,6 +69,10 @@ class HoldInvoiceBackend(ABC):
     @abstractmethod
     async def get_invoice(self, payment_hash: str) -> Invoice: ...
 
+    async def prune_invoice(self, payment_hash: str) -> bool:
+        """Remove an expired unpaid invoice, or return False if safety is unknown."""
+        return False
+
     @abstractmethod
     async def settle_invoice(self, preimage: bytes) -> None: ...
 
@@ -283,6 +287,34 @@ class FakeBackend(HoldInvoiceBackend):
                 (InvoiceState.canceled.value, payment_hash),
             )
 
+    async def prune_invoice(self, payment_hash: str) -> bool:
+        with self.db.read() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM invoices WHERE payment_hash=?", (payment_hash,)
+            ).fetchone()
+        if row is None:
+            return True
+        invoice = await self.get_invoice(payment_hash)
+        now = int(time.time())
+        if (
+            invoice.state not in (InvoiceState.open, InvoiceState.canceled)
+            or invoice.amount_paid != 0
+            or invoice.expiry > now
+        ):
+            return False
+        with self.db.transaction() as conn:
+            deleted = conn.execute(
+                "DELETE FROM invoices WHERE payment_hash=? AND expiry<=? "
+                "AND amount_paid=0 AND state IN (?,?)",
+                (
+                    payment_hash,
+                    now,
+                    InvoiceState.open.value,
+                    InvoiceState.canceled.value,
+                ),
+            )
+        return deleted.rowcount == 1
+
     def receiver_invoice(
         self,
         amount: int,
@@ -488,9 +520,13 @@ class LndRestBackend(HoldInvoiceBackend):
         path: str,
         body: dict | None = None,
         params: dict | None = None,
-    ) -> dict:
+        *,
+        allow_not_found: bool = False,
+    ) -> dict | None:
         try:
             response = await self.client.request(method, path, json=body, params=params)
+            if allow_not_found and response.status_code == 404:
+                return None
             response.raise_for_status()
             return response.json()
         except (httpx.HTTPError, ValueError) as exc:
@@ -559,8 +595,12 @@ class LndRestBackend(HoldInvoiceBackend):
             return existing
         return await self.get_invoice(payment_hash)
 
-    async def get_invoice(self, payment_hash: str) -> Invoice:
-        body = await self._call("GET", f"/v1/invoice/{payment_hash}")
+    async def _lookup_invoice(self, payment_hash: str) -> Invoice | None:
+        body = await self._call(
+            "GET", f"/v1/invoice/{payment_hash}", allow_not_found=True
+        )
+        if body is None:
+            return None
         try:
             invoice = LndInvoice.model_validate(body)
             if base64.b64decode(invoice.r_hash, validate=True).hex() != payment_hash:
@@ -588,6 +628,12 @@ class LndRestBackend(HoldInvoiceBackend):
             )
         except ValueError as exc:
             raise BackendError("LND returned invalid invoice metadata") from exc
+
+    async def get_invoice(self, payment_hash: str) -> Invoice:
+        invoice = await self._lookup_invoice(payment_hash)
+        if invoice is None:
+            raise BackendError("unknown LND hold invoice")
+        return invoice
 
     async def get_block_height(self) -> int | None:
         body = await self._call("GET", "/v1/getinfo")
@@ -626,6 +672,44 @@ class LndRestBackend(HoldInvoiceBackend):
             "/v2/invoices/settle",
             {"preimage": base64.b64encode(preimage).decode()},
         )
+
+    async def prune_invoice(self, payment_hash: str) -> bool:
+        invoice = await self._lookup_invoice(payment_hash)
+        if invoice is None:
+            return True
+        now = int(time.time())
+        if (
+            invoice.state not in (InvoiceState.open, InvoiceState.canceled)
+            or invoice.amount_paid != 0
+            or invoice.expiry > now
+        ):
+            return False
+        if invoice.state == InvoiceState.open:
+            await self._call(
+                "POST",
+                "/v2/invoices/cancel",
+                {
+                    "payment_hash": base64.b64encode(
+                        bytes.fromhex(payment_hash)
+                    ).decode()
+                },
+            )
+            invoice = await self._lookup_invoice(payment_hash)
+            if invoice is None:
+                return True
+        if (
+            invoice.state != InvoiceState.canceled
+            or invoice.amount_paid != 0
+            or invoice.expiry > now
+        ):
+            return False
+        await self._call(
+            "DELETE",
+            "/v1/invoices",
+            params={"invoice_hash": payment_hash},
+            allow_not_found=True,
+        )
+        return True
 
     def _stream_http_timeout(self) -> httpx.Timeout:
         # Keep per-read timeouts safely above the total stream deadline so a

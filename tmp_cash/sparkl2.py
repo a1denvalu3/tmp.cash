@@ -458,6 +458,27 @@ class SparkBackend(HoldInvoiceBackend):
             hold_expires_at=deadline,
         )
 
+    async def prune_invoice(self, payment_hash: str) -> bool:
+        with self.db.read() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM invoices WHERE payment_hash=?", (payment_hash,)
+            ).fetchone()
+        if row is None:
+            return True
+        invoice = await self.get_invoice(payment_hash)
+        if (
+            invoice.state != InvoiceState.canceled
+            or invoice.amount_paid != 0
+            or invoice.expiry > int(time.time())
+        ):
+            return False
+        with self.db.transaction() as conn:
+            deleted = conn.execute(
+                "DELETE FROM invoices WHERE payment_hash=? AND state=? AND expiry<=?",
+                (payment_hash, InvoiceState.canceled.value, int(time.time())),
+            )
+        return deleted.rowcount == 1
+
     async def get_block_height(self) -> int | None:
         # Spark supplies the funded contract's expiry as a Unix timestamp.
         await self._ensure_sdk()
