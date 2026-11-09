@@ -1575,3 +1575,27 @@ input[type="file"] {
   min-height: 44px;
   text-decoration: none;
 }
+.recovery-options {
+  border: 0;
+  padding: 0;
+  margin: 20px 0;
+  display: grid;
+  gap: 12px;
+}
+.recovery-options label {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.recovery-options input[type="radio"] {
+  width: auto;
+  margin: 0;
+}
+.google-recovery form {
+  margin: 20px 0;
+}
+.google-recovery select {
+  width: 100%;
+  max-width: 100%;
+  margin-bottom: 12px;
+}

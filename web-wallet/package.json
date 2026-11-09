@@ -23,6 +23,7 @@
     "@fontsource/dm-sans": "5.2.6",
     "coco-cashu-core": "file:packages/coco",
     "coco-cashu-indexeddb": "file:packages/coco-indexeddb",
+    "firebase": "12.12.1",
     "lucide-react": "0.468.0",
     "qr-scanner": "1.4.2",
     "qrcode": "1.5.4",

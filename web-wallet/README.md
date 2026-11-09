@@ -118,10 +118,13 @@ over HTTPS and use an HTTPS mint; browsers block mixed-content requests.
   encrypted backups. Historical tokens may already be spent or expired; incoming
   tokens were exchanged for fresh proofs. Older entries remain readable and
   clearly indicate details that were not recorded.
-- **Settings:** exports/restores password-encrypted backups containing proofs,
+- **Settings:** exports/restores passphrase-encrypted or explicitly unencrypted backups containing proofs,
   backing preimages, pending request secrets, and the outgoing token history.
   Restore requires an empty wallet in a new browser profile. A snapshot backup
   cannot recover operations created after it was downloaded.
+- **Google recovery:** optional Google login and automatic Google Drive copies in
+  either backup format. See [setup instructions](../docs/google-recovery.md).
+  Backups do not coordinate spending between devices.
 - **Debug logs:** in Settings, choose **Copy debug logs** and paste the report
   into your support chat, or choose **Download logs** to share a JSON file.
   A selectable report appears if clipboard access is unavailable. Logs also

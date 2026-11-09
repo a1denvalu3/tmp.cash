@@ -648,53 +648,77 @@ test("mobile navigation, invalid tokens, and offline balance visibility", async 
   await expect(page.getByTestId("balance")).toHaveText("—sats");
 });
 
-test("exports a real encrypted wallet backup and restores it in an empty browser profile", async ({
-  page,
-  browser,
-}) => {
-  await page.goto("/wallet/");
-  await expect(page.getByText("Mint connected", { exact: true })).toBeVisible();
-  await fund(page, 64);
-  await page.getByRole("button", { name: "Send", exact: true }).click();
-  await page.getByLabel("Amount in sats").fill("10");
-  await page.getByRole("button", { name: "Create token" }).click();
-  await expect(page.getByLabel("Outgoing token")).toHaveValue(/^cashuPS/);
-  await page.getByRole("button", { name: "Close dialog" }).click();
-  await page.getByRole("button", { name: "Settings", exact: true }).click();
-  await page.getByRole("button", { name: "Export backup" }).click();
-  await page.getByLabel("Backup password").fill("a practical test passphrase");
-  const downloaded = page.waitForEvent("download");
-  await page.getByRole("button", { name: "Download encrypted backup" }).click();
-  const download = await downloaded,
-    buffer = await readFile((await download.path())!);
-  expect(buffer.toString()).not.toContain("credential");
-  const context = await browser.newContext(),
-    restored = await context.newPage();
-  await restored.addInitScript(
-    (url) => localStorage.setItem("layer3-mint", url),
-    mintUrl,
-  );
-  await restored.goto(walletUrl);
-  await expect(
-    restored.getByText("Mint connected", { exact: true }),
-  ).toBeVisible();
-  await restored.getByRole("button", { name: "Settings", exact: true }).click();
-  await restored.getByRole("button", { name: "Restore backup" }).click();
-  await restored.getByLabel("Backup file").setInputFiles({
-    name: "backup.json",
-    mimeType: "application/json",
-    buffer,
+for (const protection of ["encrypted", "plaintext"] as const)
+  test(`exports a real ${protection} wallet backup and restores it in an empty browser profile`, async ({
+    page,
+    browser,
+  }) => {
+    await page.goto("/wallet/");
+    await expect(
+      page.getByText("Mint connected", { exact: true }),
+    ).toBeVisible();
+    await fund(page, 64);
+    await page.getByRole("button", { name: "Send", exact: true }).click();
+    await page.getByLabel("Amount in sats").fill("10");
+    await page.getByRole("button", { name: "Create token" }).click();
+    await expect(page.getByLabel("Outgoing token")).toHaveValue(/^cashuPS/);
+    await page.getByRole("button", { name: "Close dialog" }).click();
+    await page.getByRole("button", { name: "Settings", exact: true }).click();
+    await page.getByRole("button", { name: "Export backup" }).click();
+    await expect(page.getByLabel("Encrypt with a passphrase")).toBeChecked();
+    await expect(
+      page.getByRole("button", { name: "Download encrypted backup" }),
+    ).toBeVisible();
+    if (protection === "encrypted")
+      await page
+        .getByLabel("Backup password")
+        .fill("a practical test passphrase");
+    else {
+      await page.getByLabel("Save without encryption").check();
+      await expect(page.getByLabel("Backup password")).toHaveCount(0);
+    }
+    const downloaded = page.waitForEvent("download");
+    await page
+      .getByRole("button", { name: `Download ${protection} backup` })
+      .click();
+    const download = await downloaded,
+      buffer = await readFile((await download.path())!);
+    if (protection === "encrypted")
+      expect(buffer.toString()).not.toContain("credential");
+    else expect(buffer.toString()).toContain("credential");
+    const context = await browser.newContext(),
+      restored = await context.newPage();
+    await restored.addInitScript(
+      (url) => localStorage.setItem("layer3-mint", url),
+      mintUrl,
+    );
+    await restored.goto(walletUrl);
+    await expect(
+      restored.getByText("Mint connected", { exact: true }),
+    ).toBeVisible();
+    await restored
+      .getByRole("button", { name: "Settings", exact: true })
+      .click();
+    await restored.getByRole("button", { name: "Restore backup" }).click();
+    await restored.getByLabel("Backup file").setInputFiles({
+      name: "backup.json",
+      mimeType: "application/json",
+      buffer,
+    });
+    if (protection === "encrypted")
+      await restored
+        .getByLabel("Backup password")
+        .fill("a practical test passphrase");
+    else await expect(restored.getByLabel("Backup password")).toHaveCount(0);
+    await restored.getByRole("button", { name: "Restore wallet" }).click();
+    await expect(restored.getByRole("dialog")).toHaveCount(0);
+    await restored.getByRole("button", { name: "Wallet", exact: true }).click();
+    await expect(restored.getByTestId("balance")).toHaveText("54sats");
+    await restored
+      .getByRole("button", { name: "Activity", exact: true })
+      .click();
+    await expect(
+      restored.getByRole("button", { name: /^View Sent ecash details/ }),
+    ).toBeVisible();
+    await context.close();
   });
-  await restored
-    .getByLabel("Backup password")
-    .fill("a practical test passphrase");
-  await restored.getByRole("button", { name: "Restore wallet" }).click();
-  await expect(restored.getByRole("dialog")).toHaveCount(0);
-  await restored.getByRole("button", { name: "Wallet", exact: true }).click();
-  await expect(restored.getByTestId("balance")).toHaveText("54sats");
-  await restored.getByRole("button", { name: "Activity", exact: true }).click();
-  await expect(
-    restored.getByRole("button", { name: /^View Sent ecash details/ }),
-  ).toBeVisible();
-  await context.close();
-});

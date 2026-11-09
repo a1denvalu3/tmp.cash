@@ -4,6 +4,8 @@ import {
   useMemo,
   useRef,
   useState,
+  lazy,
+  Suspense,
   type CSSProperties,
   type FormEvent,
   type ReactNode,
@@ -47,7 +49,15 @@ import {
   type PSLnurlPayRequest,
   type PSMeltQuote,
 } from "@cashu/cashu-ts/tmp-cash";
-import { decryptBackup, encryptBackup, MAX_BACKUP_LENGTH } from "./backup";
+import {
+  backupProtection,
+  restoreBackup,
+  plaintextBackup,
+  encryptBackup,
+  MAX_BACKUP_LENGTH,
+} from "./backup";
+import { RecoveryProtection } from "./RecoveryProtection";
+import { googleConfigured } from "./google-config";
 import { useTheme } from "./theme";
 import { TmpCashMark } from "./TmpCashMark";
 import { expiredBackings } from "./backings";
@@ -69,6 +79,11 @@ import {
 } from "./diagnostics";
 
 const repo = new TmpCashIndexedDbRepository();
+const GoogleRecovery = lazy(() =>
+  import("./GoogleRecovery").then((module) => ({
+    default: module.GoogleRecovery,
+  })),
+);
 const defaultMint =
   import.meta.env.VITE_DEFAULT_MINT || "http://127.0.0.1:3338";
 const initialMint = (() => {
@@ -309,6 +324,11 @@ export function App() {
   const [funding, setFunding] = useState<TmpCashFunding | null>(null),
     [password, setPassword] = useState(""),
     [backupFile, setBackupFile] = useState<File | null>(null);
+  const [backupMode, setBackupMode] = useState<"passphrase" | "plaintext">(
+    "passphrase",
+  );
+  const [restoreRaw, setRestoreRaw] = useState<string | null>(null);
+  const backupSelection = useRef(0);
   const [tick, setTick] = useState(0),
     [reconnect, setReconnect] = useState(0);
   const busyRef = useRef(false);
@@ -550,6 +570,9 @@ export function App() {
     setSelectedHash("");
     setFunding(null);
     setPassword("");
+    setBackupMode("passphrase");
+    setRestoreRaw(null);
+    backupSelection.current++;
     setBackupFile(null);
     setDialog(next);
   }
@@ -558,7 +581,18 @@ export function App() {
       setDialog(null);
       setError("");
       setPassword("");
+      setRestoreRaw(null);
+      backupSelection.current++;
     }
+  }
+  async function restoreWallet(raw: string, passphrase: string) {
+    const restored = await restoreBackup(raw, passphrase);
+    await repo.importState(restored.state);
+    localStorage.setItem("layer3-mint", restored.mint);
+    setMintUrl(restored.mint);
+    setMintInput(restored.mint);
+    setReconnect((value) => value + 1);
+    setNotice("Backup restored. Verifying tokens and their backings…");
   }
   function showToken(value: string) {
     open("token");
@@ -1268,9 +1302,9 @@ export function App() {
               <section className="settings-card">
                 <h2>Keep a copy.</h2>
                 <p className="muted">
-                  Back up your tokens, preimages, and pending operations in a
-                  password-encrypted file. Clearing browser data removes this
-                  wallet.
+                  Back up your tokens, preimages, and pending operations. Choose
+                  passphrase encryption or save without encryption. Clearing
+                  browser data removes this wallet.
                 </p>
                 <button className="button dark" onClick={() => open("backup")}>
                   <Download size={17} />
@@ -1291,6 +1325,23 @@ export function App() {
               <DiagnosticsPanel />
             </div>
           </>
+        )}
+        {googleConfigured && (
+          <div hidden={tab !== "settings"}>
+            <div className="settings-grid">
+              <Suspense fallback={<p>Opening Google recovery…</p>}>
+                <GoogleRecovery
+                  state={view}
+                  mint={mintUrl}
+                  onRestore={(raw, passphrase) =>
+                    diagnoseAction("restore", () =>
+                      restoreWallet(raw, passphrase),
+                    )
+                  }
+                />
+              </Suspense>
+            </div>
+          </div>
         )}
       </main>
       <footer>
@@ -1337,8 +1388,8 @@ export function App() {
               receive:
                 "Paste an ecash token. We’ll refresh its proofs before adding it.",
               pay: "Pay an invoice, Lightning address, or LNURL with your ecash.",
-              backup: "Protect this file with a password you can remember.",
-              restore: "Restore an encrypted backup into this empty wallet.",
+              backup: "Choose how to protect your recovery copy.",
+              restore: "Restore a backup into this empty wallet.",
               token:
                 "Share this token with its recipient before the backing deadline.",
               preimage:
@@ -1890,11 +1941,14 @@ export function App() {
                 e.preventDefault();
                 run(dialog, async () => {
                   if (dialog === "backup") {
-                    const text = await encryptBackup(
-                        await repo.read(),
-                        mintUrl,
-                        password,
-                      ),
+                    const text =
+                        backupMode === "plaintext"
+                          ? plaintextBackup(await repo.read(), mintUrl)
+                          : await encryptBackup(
+                              await repo.read(),
+                              mintUrl,
+                              password,
+                            ),
                       url = URL.createObjectURL(
                         new Blob([text], { type: "application/json" }),
                       );
@@ -1905,20 +1959,18 @@ export function App() {
                     setTimeout(() => URL.revokeObjectURL(url), 1000);
                     setDialog(null);
                     setPassword("");
-                    setNotice("Encrypted backup downloaded.");
+                    setNotice(
+                      backupMode === "plaintext"
+                        ? "Unencrypted backup downloaded."
+                        : "Encrypted backup downloaded.",
+                    );
                   } else {
                     if (!backupFile) throw new Error("Choose a backup file");
                     if (backupFile.size > MAX_BACKUP_LENGTH)
                       throw new Error("Backup is too large");
-                    const restored = await decryptBackup(
-                      await backupFile.text(),
-                      password,
-                    );
-                    await repo.importState(restored.state);
-                    localStorage.setItem("layer3-mint", restored.mint);
-                    setMintUrl(restored.mint);
-                    setMintInput(restored.mint);
-                    setReconnect((n) => n + 1);
+                    if (!restoreRaw)
+                      throw new Error("Choose a valid backup file");
+                    await restoreWallet(restoreRaw, password);
                     setDialog(null);
                     setPassword("");
                     setNotice(
@@ -1936,25 +1988,67 @@ export function App() {
                     type="file"
                     accept="application/json,.json"
                     required
-                    onChange={(e) => setBackupFile(e.target.files?.[0] ?? null)}
+                    onChange={(event) => {
+                      const file = event.target.files?.[0] ?? null;
+                      const selection = ++backupSelection.current;
+                      setBackupFile(file);
+                      setRestoreRaw(null);
+                      setPassword("");
+                      setError("");
+                      if (!file) return;
+                      if (file.size > MAX_BACKUP_LENGTH) {
+                        setError("Backup is too large");
+                        return;
+                      }
+                      void file
+                        .text()
+                        .then((raw) => {
+                          backupProtection(raw);
+                          if (selection === backupSelection.current)
+                            setRestoreRaw(raw);
+                        })
+                        .catch(() => {
+                          if (selection === backupSelection.current)
+                            setError("Invalid or unsupported backup file");
+                        });
+                    }}
                   />
                 </>
               )}
-              <label htmlFor="backup-password">Backup password</label>
-              <input
-                autoFocus={dialog === "backup"}
-                id="backup-password"
-                type="password"
-                minLength={12}
-                required
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                autoComplete={
-                  dialog === "backup" ? "new-password" : "current-password"
-                }
-                placeholder="At least 12 characters"
-              />
-              <button className="button dark full" disabled={busy}>
+              {dialog === "backup" && (
+                <RecoveryProtection
+                  mode={backupMode}
+                  onChange={(mode) => {
+                    setBackupMode(mode);
+                    setPassword("");
+                  }}
+                />
+              )}
+              {(dialog === "backup"
+                ? backupMode === "passphrase"
+                : !restoreRaw ||
+                  backupProtection(restoreRaw).mode === "passphrase") && (
+                <>
+                  <label htmlFor="backup-password">Backup password</label>
+                  <input
+                    autoFocus={dialog === "backup"}
+                    id="backup-password"
+                    type="password"
+                    minLength={12}
+                    required
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    autoComplete={
+                      dialog === "backup" ? "new-password" : "current-password"
+                    }
+                    placeholder="At least 12 characters"
+                  />
+                </>
+              )}
+              <button
+                className="button dark full"
+                disabled={busy || (dialog === "restore" && !restoreRaw)}
+              >
                 {busy ? (
                   <LoaderCircle className="spinning" size={18} />
                 ) : dialog === "backup" ? (
@@ -1963,7 +2057,9 @@ export function App() {
                   <Upload size={18} />
                 )}
                 {dialog === "backup"
-                  ? "Download encrypted backup"
+                  ? backupMode === "plaintext"
+                    ? "Download plaintext backup"
+                    : "Download encrypted backup"
                   : "Restore wallet"}
               </button>
               <p className="small muted">
