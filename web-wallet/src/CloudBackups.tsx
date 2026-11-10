@@ -92,6 +92,9 @@ export function useCloudBackups(
   const [selected, setSelected] = useState<CloudBackup | null>(null),
     [googleReady, setGoogleReady] = useState(false),
     [loadVersion, setLoadVersion] = useState(0);
+  const [exactCopy, setExactCopy] = useState(false),
+    [showHistory, setShowHistory] = useState(false),
+    [emptyCopies, setEmptyCopies] = useState<Set<string>>(() => new Set());
   const [wasDismissed, setWasDismissed] = useState(dismissed),
     [rememberedBackup, setRememberedBackup] = useState(false);
   const [protection, setProtection] = useState<"encrypted" | "plaintext">(
@@ -292,6 +295,9 @@ export function useCloudBackups(
     );
   }
   function connected(value: CloudClient) {
+    setExactCopy(false);
+    setShowHistory(false);
+    setEmptyCopies(new Set());
     try {
       localStorage.setItem("tmpcash-backup-provider", value.user.provider);
     } catch {
@@ -355,13 +361,17 @@ export function useCloudBackups(
       throw new Error(
         "Please confirm that you understand who can access this backup.",
       );
-    // Discovery can be stale, or the original device can save again while the
-    // user chooses a wallet. Resolve its latest copy before importing anything.
+    // Refresh the latest copy unless the user explicitly chose an earlier one.
     const files = await client.list();
     setBackups(files);
-    const backup = files
-      .filter((value) => value.walletId === selected.walletId)
-      .sort((a, b) => b.updated - a.updated)[0];
+    const backup = exactCopy
+      ? files.find(
+          (value) =>
+            value.id === selected.id && value.walletId === selected.walletId,
+        )
+      : files
+          .filter((value) => value.walletId === selected.walletId)
+          .sort((a, b) => b.updated - a.updated)[0];
     if (!backup)
       throw new Error(
         "This saved wallet is no longer available. Choose another saved wallet.",
@@ -378,10 +388,13 @@ export function useCloudBackups(
     if (isEncryptedBackup(raw) !== backup.encrypted)
       throw new Error("This saved wallet changed. Please select it again.");
     const data = await restoreBackup(raw, password);
-    if (!Object.values(data.state).some((records) => records.length > 0))
+    if (!Object.values(data.state).some((records) => records.length > 0)) {
+      setEmptyCopies((value) => new Set([...value, backup.id]));
+      setShowHistory(true);
       throw new Error(
         "This saved copy is empty. Choose another saved wallet or save a new backup from the original wallet.",
       );
+    }
     const encryption = backup.encrypted
       ? await createBackupKey(password)
       : null;
@@ -542,12 +555,16 @@ export function useCloudBackups(
         {step === "choose" && (
           <>
             <div className="backup-wallet-picker">
-              {latest.slice(0, 10).map((backup) => (
+              {(showHistory ? backups : latest).map((backup) => (
                 <button
                   key={backup.id}
                   className="backup-choice"
+                  disabled={emptyCopies.has(backup.id)}
                   onClick={() => {
                     setSelected(backup);
+                    setExactCopy(
+                      !latest.some((value) => value.id === backup.id),
+                    );
                     setPassword("");
                     setAcknowledged(false);
                     setError("");
@@ -560,12 +577,34 @@ export function useCloudBackups(
                     <small>
                       Saved {new Date(backup.updated).toLocaleString()} ·{" "}
                       {backup.encrypted ? "Password protected" : "Account only"}
+                      {showHistory &&
+                        (latest.some((value) => value.id === backup.id)
+                          ? " · Latest copy"
+                          : " · Earlier copy")}
+                      {emptyCopies.has(backup.id) && " · Empty copy"}
                     </small>
                   </span>
                   <ArrowRight size={18} />
                 </button>
               ))}
             </div>
+            {showHistory && (
+              <p className="small muted backup-note">
+                Earlier copies may miss recent activity. The wallet checks
+                restored tokens with the mint before showing a spendable
+                balance.
+              </p>
+            )}
+            {backups.length > latest.length && (
+              <button
+                className="text-button centered"
+                onClick={() => setShowHistory((value) => !value)}
+              >
+                {showHistory
+                  ? "Show latest copies only"
+                  : "Show earlier saved copies"}
+              </button>
+            )}
             <button
               className="text-button centered"
               onClick={() => setStep("protection")}
@@ -725,9 +764,18 @@ export function useCloudBackups(
               <Cloud size={22} />
               <div>
                 <strong>{selected.name}</strong>
-                <span>Saved {new Date(selected.updated).toLocaleString()}</span>
+                <span>
+                  {exactCopy && "Earlier copy · "}
+                  Saved {new Date(selected.updated).toLocaleString()}
+                </span>
               </div>
             </div>
+            {emptyCopies.has(selected.id) && selected.encrypted && (
+              <p className="small muted backup-note">
+                Your backup password unlocked this copy successfully. Choose
+                another saved copy to look for your wallet data.
+              </p>
+            )}
             {selected.encrypted ? (
               <>
                 <label htmlFor="cloud-restore-password">Backup password</label>
@@ -780,7 +828,7 @@ export function useCloudBackups(
               }}
             >
               <ArrowLeft size={15} />
-              Choose another saved wallet
+              Choose another saved copy
             </button>
             <p className="small muted backup-note">
               Use one active copy of a restored wallet to avoid competing
@@ -966,6 +1014,7 @@ export function useCloudBackups(
                         disabled={working}
                         onClick={() => {
                           setSelected(backup);
+                          setExactCopy(false);
                           setPassword("");
                           setAcknowledged(false);
                           setError("");

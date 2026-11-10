@@ -1,5 +1,6 @@
 import { test, expect, type BrowserContext, type Page } from "@playwright/test";
 import { psInvoiceDetails } from "@cashu/cashu-ts/tmp-cash";
+import { encryptBackup } from "../../src/backup";
 
 test.skip(
   process.env.WALLET_E2E_CLOUD !== "1",
@@ -430,11 +431,103 @@ test("does not report recovery success or create another backup when a saved cop
     ).toBeVisible();
     expect(state.uploads).toBe(uploads);
     await restored
-      .getByRole("button", { name: "Choose another saved wallet" })
+      .getByRole("button", { name: "Choose another saved copy" })
       .click();
     await expect(
       restored.getByRole("button", { name: /My empty wallet/ }),
     ).toBeVisible();
+    expect(state.mintLeaks).toEqual([]);
+  } finally {
+    await fresh.close();
+  }
+});
+
+test("recovers an earlier populated copy when the newest copy is empty", async ({
+  page,
+  context,
+  browser,
+}) => {
+  const state = providerState();
+  await providers(context, state);
+  await welcome(page);
+  await page.getByRole("button", { name: "Not now", exact: true }).click();
+  await fund(page, 1000);
+  await page
+    .getByRole("button", { name: "Set up wallet backup", exact: true })
+    .click();
+  await signIn(page);
+  await chooseProtection(page, true, "My recovery wallet");
+  await finish(page);
+  const populated = [...state.files.values()][0];
+  const empty = {
+    ...populated,
+    id: "drive-empty-head",
+    appProperties: {
+      ...populated.appProperties,
+      uploadId: "empty-head",
+      created: String(Number(populated.appProperties.created) + 1),
+    },
+    payload: await encryptBackup(
+      { proofs: [], operations: [], fundings: [], activity: [] },
+      mintUrl,
+      passphrase,
+    ),
+  };
+  state.files.set(empty.id, empty);
+  // Repeated empty-wallet setup must not hide the populated wallet after ten entries.
+  for (let i = 0; i < 11; i++) {
+    const id = `drive-other-empty-${i}`;
+    state.files.set(id, {
+      ...empty,
+      id,
+      name: `Other empty wallet ${i}`,
+      appProperties: {
+        ...empty.appProperties,
+        walletId: `other-wallet-${i}`,
+        uploadId: `other-copy-${i}`,
+        created: String(Number(empty.appProperties.created) + i + 1),
+      },
+    });
+  }
+  const uploads = state.uploads;
+  const fresh = await browser.newContext();
+  try {
+    await providers(fresh, state);
+    const restored = await fresh.newPage();
+    await welcome(restored);
+    await signIn(restored);
+    await restored.getByRole("button", { name: /My recovery wallet/ }).click();
+    await restored
+      .getByLabel("Backup password", { exact: true })
+      .fill(passphrase);
+    await restored.getByRole("button", { name: "Restore my wallet" }).click();
+    await expect(restored.getByRole("alert")).toContainText(
+      "saved copy is empty",
+    );
+    await expect(
+      restored.getByText(/password unlocked this copy successfully/),
+    ).toBeVisible();
+    expect(state.uploads).toBe(uploads);
+    await restored
+      .getByRole("button", { name: "Choose another saved copy" })
+      .click();
+    await expect(
+      restored.getByRole("button", { name: /My recovery wallet.*Empty copy/ }),
+    ).toBeDisabled();
+    await restored
+      .getByRole("button", { name: /My recovery wallet.*Earlier copy/ })
+      .click();
+    await restored
+      .getByLabel("Backup password", { exact: true })
+      .fill(passphrase);
+    await restored.getByRole("button", { name: "Restore my wallet" }).click();
+    await expect(
+      restored.getByRole("dialog", { name: "Your wallet is backed up." }),
+    ).toBeVisible();
+    await restored.getByRole("button", { name: "Back to my wallet" }).click();
+    await expect(restored.getByTestId("balance")).toHaveText("1,000sats");
+    expect(state.files.get(populated.id)).toEqual(populated);
+    expect(state.files.get(empty.id)).toEqual(empty);
     expect(state.mintLeaks).toEqual([]);
   } finally {
     await fresh.close();

@@ -334,9 +334,13 @@ Google listings are bounded to the newest 1,000 files and Apple to 200 manifests
 
 Restore requires an empty local wallet and validates the complete wallet state.
 Recovery rechecks the newest saved copy for the chosen wallet before downloading
-it, so an older discovery result does not hide a more recent save. A completely
-empty copy reports an error and offers another wallet instead of reporting
-successful recovery and creating another empty backup.
+it. Users can also explicitly choose an earlier saved copy; that selection is
+preserved instead of silently substituting the newest one. Empty copies report
+an error, confirm successful password decryption when applicable, and expose the
+saved history. Known empty copies are marked and disabled in the picker. All
+discovered wallets remain available rather than truncating the picker to ten.
+Recovery never reports success or creates another restored wallet from an empty
+copy.
 It includes proofs, backing preimages, pending requests, funding recovery data,
 and activity. A successful restore enables continued automatic backups using the
 same protection choice. Use one active copy to avoid competing spends. Backups
