@@ -1,5 +1,6 @@
 import { test, expect, type BrowserContext, type Page } from "@playwright/test";
 import { psInvoiceDetails } from "@cashu/cashu-ts/tmp-cash";
+import { observeWalletUi, walletUiHistory } from "../helpers/wallet-ui-history";
 import { testRelay } from "../helpers/nostr-relay";
 
 let relay: Awaited<ReturnType<typeof testRelay>>;
@@ -122,4 +123,31 @@ test("allows retrying a valid but unknown sync code without trapping an empty wa
   await expect(
     page.getByRole("button", { name: "Pause sync on this device" }),
   ).toHaveCount(0);
+});
+
+test("keeps an empty wallet's balance and mint status stable across relay polls", async ({
+  page,
+  context,
+}) => {
+  await prepare(context);
+  await page.goto("/wallet/");
+  await expect(page.getByTestId("balance")).toHaveText("0sats");
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await page.getByLabel("Relay URLs").fill(relay.url);
+  await page.getByRole("button", { name: "Enable device sync" }).click();
+  await expect(page.getByLabel("Your private sync code")).toHaveValue(
+    /^tmpcash-sync1:/,
+  );
+  await page.getByRole("button", { name: "Wallet", exact: true }).click();
+  await expect(page.getByTestId("balance")).toHaveText("0sats");
+  await expect(page.getByTestId("mint-status")).toHaveText("Mint connected");
+  const before = relay.state.reads;
+  await observeWalletUi(page);
+  await expect
+    .poll(() => relay.state.reads, { timeout: 20000 })
+    .toBeGreaterThanOrEqual(before + 6);
+  expect(await walletUiHistory(page)).toEqual({
+    balances: ["0sats"],
+    mint: ["Mint connected"],
+  });
 });

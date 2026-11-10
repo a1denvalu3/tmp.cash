@@ -42,14 +42,25 @@ export class TmpCashManager {
       this.verifiedAt = 0;
       try {
         await apply();
-      } finally {
-        await this.changed();
+      } catch (error) {
+        // A provider can fail after importing part of a checkpoint. Recheck
+        // those records, while preserving the provider error for the sync UI.
+        try {
+          await this.refreshUnlocked();
+        } catch {
+          // refreshUnlocked publishes an unverified view if the mint fails too.
+        }
+        throw error;
       }
+      // Publish the refreshed result once, rather than flashing an intermediate
+      // unverified balance on every background poll. Imported proofs remain
+      // unverified internally until the mint check completes.
       await this.refreshUnlocked();
     });
   }
   private snapshot: PSSnapshot | null = null;
   private verifiedAt = 0;
+  private mintConnected = false;
   private verifiedProofs = new Set<string>();
   private queue: Promise<unknown> = Promise.resolve();
   private refreshTask: Promise<void> | null = null;
@@ -101,6 +112,7 @@ export class TmpCashManager {
       expired: sum("expired"),
       snapshot: this.snapshot,
       verified,
+      mintConnected: this.mintConnected,
     };
   }
   private isLive(proof: PSProof) {
@@ -186,9 +198,11 @@ export class TmpCashManager {
       }
       await this.repo.updateProofStates(changes);
       this.verifiedAt = Date.now();
+      this.mintConnected = true;
       await this.changed();
     } catch (error) {
       this.verifiedAt = 0;
+      this.mintConnected = false;
       await this.changed();
       throw error;
     }

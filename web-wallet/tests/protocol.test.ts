@@ -1,4 +1,4 @@
-import { beforeAll, afterAll, describe, it, expect } from "vitest";
+import { beforeAll, afterAll, describe, it, expect, vi } from "vitest";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createServer } from "node:net";
 import "fake-indexeddb/auto";
@@ -1680,5 +1680,165 @@ describe("multi-device wallet recovery and conflict resolution", () => {
     expect(calls).toBe(2);
     expect((await a.repo.read()).operations).toEqual([]);
     expect((await a.manager.view()).balance).toBe(8);
+  });
+  it("publishes only verified results during repeated background synchronization", async () => {
+    const { manager } = await funded();
+    const updates: { verified: boolean; balance: number }[] = [];
+    const stop = manager.events.on("change", async () => {
+      const view = await manager.view();
+      updates.push({ verified: view.verified, balance: view.balance });
+    });
+    try {
+      for (let i = 0; i < 3; i++) await manager.synchronize(async () => {});
+      expect(updates).toEqual(
+        Array.from({ length: 3 }, () => ({ verified: true, balance: 16 })),
+      );
+    } finally {
+      stop();
+    }
+  });
+  it("rechecks the mint after a provider error instead of publishing a false offline state", async () => {
+    const { manager } = await funded();
+    const updates: boolean[] = [];
+    const stop = manager.events.on("change", async () => {
+      updates.push((await manager.view()).verified);
+    });
+    try {
+      await expect(
+        manager.synchronize(async () => {
+          throw new Error("Drive unavailable");
+        }),
+      ).rejects.toThrow("Drive unavailable");
+      expect(updates).toEqual([true]);
+      expect((await manager.view()).balance).toBe(16);
+    } finally {
+      stop();
+    }
+  });
+  it("verifies partially imported records even when the provider subsequently fails", async () => {
+    const a = await funded(),
+      b = await clone(a.repo);
+    const extra = await a.manager.createFunding(8);
+    await control("accept", { payment_hash: extra.id });
+    await a.manager.pollFunding(extra.id);
+    const checkpoint = await createWalletSyncBackup(a.repo, mintUrl);
+    const updates: { verified: boolean; balance: number }[] = [];
+    const stop = b.manager.events.on("change", async () => {
+      const view = await b.manager.view();
+      updates.push({ verified: view.verified, balance: view.balance });
+    });
+    try {
+      await expect(
+        b.manager.synchronize(async () => {
+          await mergeWalletSyncBackup(b.repo, checkpoint);
+          expect((await b.manager.view()).verified).toBe(false);
+          throw new Error("Drive unavailable");
+        }),
+      ).rejects.toThrow("Drive unavailable");
+      expect(updates).toEqual([{ verified: true, balance: 24 }]);
+    } finally {
+      stop();
+    }
+  });
+  it("keeps newly imported funds unverified until the mint check completes without publishing intermediate views", async () => {
+    const a = await funded(),
+      b = await clone(a.repo);
+    const extra = await a.manager.createFunding(8);
+    await control("accept", { payment_hash: extra.id });
+    await a.manager.pollFunding(extra.id);
+    const checkpoint = await createWalletSyncBackup(a.repo, mintUrl);
+    let pause = false,
+      entered!: () => void,
+      release!: () => void;
+    const checking = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const resume = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const fetcher: typeof fetch = async (input, init) => {
+      if (pause && String(input).endsWith("/v1/checkstate")) {
+        entered();
+        await resume;
+      }
+      return fetch(input, init);
+    };
+    const manager = new TmpCashManager(b.repo, mintUrl, fetcher);
+    await manager.init();
+    const updates: { verified: boolean; balance: number }[] = [];
+    const stop = manager.events.on("change", async () => {
+      const view = await manager.view();
+      updates.push({ verified: view.verified, balance: view.balance });
+    });
+    pause = true;
+    const task = manager.synchronize(() =>
+      mergeWalletSyncBackup(b.repo, checkpoint),
+    );
+    try {
+      await checking;
+      expect(updates).toEqual([]);
+      expect(await manager.view()).toMatchObject({
+        verified: false,
+        balance: 0,
+        mintConnected: true,
+      });
+    } finally {
+      release();
+    }
+    try {
+      await task;
+      expect(updates).toEqual([{ verified: true, balance: 24 }]);
+    } finally {
+      stop();
+    }
+  });
+  it("publishes a real mint outage and restores verification when the mint recovers", async () => {
+    let offline = false;
+    const fetcher: typeof fetch = async (input, init) => {
+      if (offline && String(input).endsWith("/v1/htlcs/check"))
+        throw new Error("mint unavailable");
+      return fetch(input, init);
+    };
+    const { manager } = await funded(16, fetcher);
+    const updates: { verified: boolean; mintConnected: boolean }[] = [];
+    const stop = manager.events.on("change", async () => {
+      const view = await manager.view();
+      updates.push({
+        verified: view.verified,
+        mintConnected: view.mintConnected,
+      });
+    });
+    try {
+      offline = true;
+      await expect(manager.synchronize(async () => {})).rejects.toThrow(
+        "mint unavailable",
+      );
+      expect(updates).toEqual([{ verified: false, mintConnected: false }]);
+      expect((await manager.view()).balance).toBe(0);
+      await expect(
+        manager.synchronize(async () => {
+          throw new Error("Drive unavailable");
+        }),
+      ).rejects.toThrow("Drive unavailable");
+      offline = false;
+      await manager.refresh();
+      expect(updates.at(-1)).toEqual({ verified: true, mintConnected: true });
+      expect((await manager.view()).balance).toBe(16);
+    } finally {
+      stop();
+    }
+  });
+  it("keeps mint connectivity separate from an expired balance verification", async () => {
+    const { manager } = await funded();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 61000);
+    try {
+      expect(await manager.view()).toMatchObject({
+        verified: false,
+        balance: 0,
+        mintConnected: true,
+      });
+    } finally {
+      clock.mockRestore();
+    }
   });
 });

@@ -373,6 +373,7 @@ export function App() {
         const v = await m.view();
         if (active) {
           setView(v);
+          if (v.mintConnected) setConnectionError("");
           const balance = {
             balance: v.balance,
             redeemable: v.redeemable,
@@ -648,6 +649,7 @@ export function App() {
     backing: view?.snapshot?.htlcs.find((h) => h.payment_hash === g.hash),
   }));
   const canSpend = !!manager && !!view?.verified;
+  const mintConnected = !!manager && !!view?.mintConnected;
   const usableBalance = (view?.proofs ?? [])
     .filter((p) => {
       if (
@@ -703,11 +705,11 @@ export function App() {
         </nav>
         <div className="header-tools">
           {cloudBackups.entry}
-          <span className="local-tag">
-            <span className={`status-dot ${canSpend ? "" : "offline"}`} />
+          <span className="local-tag" data-testid="mint-status">
+            <span className={`status-dot ${mintConnected ? "" : "offline"}`} />
             {connecting
               ? "Connecting"
-              : canSpend
+              : mintConnected
                 ? "Mint connected"
                 : "Mint offline"}
           </span>

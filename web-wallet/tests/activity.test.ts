@@ -76,6 +76,7 @@ it("uses the matching mint's saved backing snapshot after expiry, even when the 
     expired: 32,
     snapshot: null,
     verified: false,
+    mintConnected: false,
   };
   const expiry: WalletActivity = {
     id: `expired-${hash}`,
