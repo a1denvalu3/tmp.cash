@@ -33,85 +33,43 @@ async function key(
     ["encrypt", "decrypt"],
   );
 }
-export interface BackupKey {
-  key: CryptoKey;
-  salt: Uint8Array<ArrayBuffer>;
-}
-export async function createBackupKey(password: string): Promise<BackupKey> {
-  const salt = crypto.getRandomValues(new Uint8Array(16));
-  return { key: await key(password, salt), salt };
-}
-function contents(state: TmpCashState, mint: string) {
-  return {
-    version: 1,
-    mint: normalizePSMintUrl(mint),
-    state: validateTmpCashState(state),
-  };
-}
-function checked(raw: string) {
-  if (new TextEncoder().encode(raw).byteLength > MAX_BACKUP_LENGTH)
-    throw new Error("Wallet state is too large for a restorable backup");
-  return raw;
-}
-export function plaintextBackup(state: TmpCashState, mint: string): string {
-  return checked(
-    JSON.stringify({ format: "tmp-cash-plaintext", ...contents(state, mint) }),
-  );
-}
-export function isEncryptedBackup(raw: string): boolean {
-  return JSON.parse(raw).format === "cashu-layer3-encrypted";
-}
-export async function restoreBackup(raw: string, password = "") {
-  if (raw.length > MAX_BACKUP_LENGTH)
-    throw new Error("Backup file is too large");
-  if (isEncryptedBackup(raw)) return decryptBackup(raw, password);
-  const data = JSON.parse(raw);
-  if (
-    data.format !== "tmp-cash-plaintext" ||
-    data.version !== 1 ||
-    typeof data.mint !== "string"
-  )
-    throw new Error("Unsupported backup format");
-  return {
-    mint: normalizePSMintUrl(data.mint),
-    state: validateTmpCashState(data.state),
-  };
-}
 export async function encryptBackup(
   state: TmpCashState,
   mint: string,
   password: string,
 ): Promise<string> {
-  return encryptBackupWithKey(state, mint, await createBackupKey(password));
-}
-export async function encryptBackupWithKey(
-  state: TmpCashState,
-  mint: string,
-  backupKey: BackupKey,
-): Promise<string> {
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const encoded = new TextEncoder().encode(
-    checked(JSON.stringify(contents(state, mint))),
+  const salt = crypto.getRandomValues(new Uint8Array(16)),
+    iv = crypto.getRandomValues(new Uint8Array(12));
+  const contents = new TextEncoder().encode(
+    JSON.stringify({
+      version: 1,
+      mint: normalizePSMintUrl(mint),
+      state: validateTmpCashState(state),
+    }),
   );
+  if (contents.byteLength > MAX_BACKUP_LENGTH)
+    throw new Error("Wallet state is too large for a restorable backup");
   const ciphertext = await crypto.subtle.encrypt(
     {
       name: "AES-GCM",
       iv,
       additionalData: new TextEncoder().encode("cashu-layer3-backup-v1"),
     },
-    backupKey.key,
-    encoded,
+    await key(password, salt),
+    contents,
   );
   const backup = JSON.stringify({
     format: "cashu-layer3-encrypted",
     version: 1,
     kdf: "PBKDF2-SHA256",
     iterations: 250000,
-    salt: toBase64(backupKey.salt),
+    salt: toBase64(salt),
     iv: toBase64(iv),
     ciphertext: toBase64(new Uint8Array(ciphertext)),
   });
-  return checked(backup);
+  if (backup.length > MAX_BACKUP_LENGTH)
+    throw new Error("Wallet state is too large for a restorable backup");
+  return backup;
 }
 export async function decryptBackup(
   raw: string,

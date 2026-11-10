@@ -150,9 +150,6 @@ const safeMessages = [
   "Invalid backup encryption parameters",
   "Incorrect password or damaged backup",
   "Unsupported backup contents",
-  "This saved wallet is no longer available. Choose another saved wallet.",
-  "The backup protection changed. Review it before restoring.",
-  "This saved copy is empty. Choose another saved wallet or save a new backup from the original wallet.",
 ] as const;
 
 type DiagnosticEvent = (typeof events)[number];

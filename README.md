@@ -17,10 +17,7 @@ workspaces for this protocol. Run `cd web-wallet && npm ci && npm run dev` and
 open http://127.0.0.1:5173 for the explainer, then choose **Open wallet**
 (or visit http://127.0.0.1:5173/wallet/ directly) with your mint running. It supports
 HODL funding, private token transfers, combined Lightning melts, expiry tracking,
-Google/Apple sign-in with automatic wallet-side cloud backups, encrypted or explicitly
-acknowledged unencrypted backup files, and retries after a reload. See the
-[cloud setup](web-wallet/README.md#cloud-backup-setup) for provider registration
-and same-origin routing. Mint endpoints enable browser CORS.
+encrypted backups, and retries after a reload. Mint endpoints enable browser CORS.
 
 ## The lifecycle
 

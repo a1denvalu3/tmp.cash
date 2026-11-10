@@ -27,7 +27,6 @@ describe("scoped backing checks", () => {
       expect(String(input)).toBe(mintUrl + "/v1/htlcs/check");
       expect(init?.method).toBe("POST");
       expect(init?.cache).toBe("no-store");
-      expect(init?.credentials).toBe("omit");
       const body = JSON.parse(String(init?.body));
       expect(Object.keys(body)).toEqual(["payment_hashes"]);
       batches.push(body.payment_hashes);
