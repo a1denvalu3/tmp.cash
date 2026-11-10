@@ -13,9 +13,11 @@
     "test": "vitest run",
     "test:e2e": "playwright test",
     "preview": "vite preview --host 127.0.0.1",
-    "test:e2e:production": "npm run build && WALLET_E2E_PRODUCTION=1 playwright test",
+    "test:e2e:production": "VITE_GOOGLE_CLIENT_ID= VITE_APPLE_CLOUDKIT_CONTAINER= VITE_APPLE_CLOUDKIT_API_TOKEN= npm run build && WALLET_E2E_PRODUCTION=1 playwright test",
     "format": "prettier --write src \"tests/**/*.ts\" packages/cashu-ts/src/tmp-cash packages/coco/tmp-cash packages/coco-indexeddb/src/tmp-cash *.ts *.json *.md",
-    "format:check": "prettier --check src \"tests/**/*.ts\" packages/cashu-ts/src/tmp-cash packages/coco/tmp-cash packages/coco-indexeddb/src/tmp-cash *.ts *.json *.md"
+    "format:check": "prettier --check src \"tests/**/*.ts\" packages/cashu-ts/src/tmp-cash packages/coco/tmp-cash packages/coco-indexeddb/src/tmp-cash *.ts *.json *.md",
+    "test:e2e:cloud": "WALLET_E2E_CLOUD=1 playwright test tests/browser/cloud.spec.ts",
+    "test:e2e:cloud:production": "VITE_GOOGLE_CLIENT_ID=browser-test-client.apps.googleusercontent.com VITE_APPLE_CLOUDKIT_CONTAINER=iCloud.tmpcash.browser-test VITE_APPLE_CLOUDKIT_API_TOKEN=browser-test-public-api-token npm run build && WALLET_E2E_CLOUD=1 WALLET_E2E_PRODUCTION=1 playwright test tests/browser/cloud.spec.ts"
   },
   "dependencies": {
     "@cashu/cashu-ts": "file:packages/cashu-ts",
