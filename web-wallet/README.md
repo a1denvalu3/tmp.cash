@@ -204,10 +204,11 @@ npm run test:e2e:production
 ```
 
 Build produces a static `dist/` with separate `index.html`,
-`how-it-works/index.html`, and `wallet/index.html`
+`how-it-works/index.html`, `privacy/index.html`, `terms/index.html`, and
+`wallet/index.html`
 entries, each with a Content Security Policy. Serve the complete directory from
 the same origin so the landing page and wallet share browser preferences and
-existing IndexedDB funds. The `/wallet/` and `/how-it-works/` entries support direct visits and reloads
+existing IndexedDB funds. The `/wallet/`, `/how-it-works/`, `/privacy/`, and `/terms/` entries support direct visits and reloads
 without requiring a server-side SPA fallback. `npm test` runs
 cross-language integration tests against a disposable Python mint, including
 private swaps, combined melts, fee change, deadlines, double-spend reservations,
@@ -220,3 +221,13 @@ fake sats and do not touch `~/cashu-regtest` or an existing mint database.
 The modified libraries are source workspaces under `packages/`; no globally
 installed packages or sibling checkouts are required. See
 [PROVENANCE.md](PROVENANCE.md) for exact upstream revisions and changes.
+
+## Public policy pages
+
+The privacy policy at `/privacy/` and terms of service at `/terms/` are public
+pages linked from the website and wallet footer. They share the site's theme
+and work on direct visits and reloads. Serve the full `dist/` directory so both
+entries and their assets are published.
+
+The production policy URLs are `https://tmp.cash/privacy/` and
+`https://tmp.cash/terms/`.
