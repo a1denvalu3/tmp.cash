@@ -10,7 +10,12 @@ import {
   Smartphone,
 } from "lucide-react";
 import type { TmpCashRepository, TmpCashState } from "coco-cashu-core/tmp-cash";
-import { createBackupKey, isEncryptedBackup, restoreBackup } from "./backup";
+import {
+  createBackupKey,
+  recoverBackupKey,
+  isEncryptedBackup,
+  restoreBackup,
+} from "./backup";
 import {
   CloudSaver,
   enableCloud,
@@ -32,6 +37,8 @@ import {
   mountAppleSignIn,
   restoreAppleSession,
 } from "./apple-cloud";
+import { assertWalletSyncGroup, mergeWalletSyncBackup } from "./sync-document";
+import type { TmpCashIndexedDbRepository } from "coco-cashu-indexeddb/tmp-cash";
 import { Modal } from "./Modal";
 import { diagnoseAction } from "./diagnostics";
 
@@ -73,7 +80,10 @@ export function useCloudBackups(
   mint: string,
   onRestored: (value: { mint: string; state: TmpCashState }) => Promise<void>,
   suspended = false,
+  synchronize: (fn: () => Promise<void>) => Promise<void> = (fn) => fn(),
 ) {
+  const synchronizeRef = useRef(synchronize);
+  synchronizeRef.current = synchronize;
   const [client, setClient] = useState<CloudClient | null>(() =>
     restoreGoogleSession(),
   );
@@ -195,7 +205,7 @@ export function useCloudBackups(
     );
     saver.current = worker;
     const save = () => {
-      void worker.save().catch(() => {});
+      void synchronizeRef.current(() => worker.save()).catch(() => {});
     };
     save();
     const timer = setInterval(save, 5000);
@@ -348,7 +358,9 @@ export function useCloudBackups(
     setProgress(null);
     setStep("saving");
     setRememberedBackup(true);
-    await saver.current?.save();
+    await synchronizeRef.current(
+      () => saver.current?.save() ?? Promise.resolve(),
+    );
   }
   async function restore() {
     if (!client || !selected) return;
@@ -396,16 +408,26 @@ export function useCloudBackups(
       );
     }
     const encryption = backup.encrypted
-      ? await createBackupKey(password)
+      ? await recoverBackupKey(raw, password)
       : null;
+    if ("mergeSyncFacts" in repo)
+      await assertWalletSyncGroup(
+        repo as TmpCashIndexedDbRepository,
+        data.sync,
+      );
     await pauseCloud();
     await onRestored(data);
+    if (data.sync && "mergeSyncFacts" in repo)
+      await mergeWalletSyncBackup(
+        repo as TmpCashIndexedDbRepository,
+        data.sync,
+      );
     currentMint.current = data.mint;
     setHasWallet(true);
     await enableCloud({
       storage: "provider-v1",
       account: client.user.account,
-      id: crypto.randomUUID(),
+      id: data.sync && !exactCopy ? backup.walletId : crypto.randomUUID(),
       name: backup.name,
       encryption,
       fingerprint: "",
@@ -415,7 +437,9 @@ export function useCloudBackups(
     setAcknowledged(false);
     setProgress(null);
     setStep("saving");
-    await saver.current?.save();
+    await synchronizeRef.current(
+      () => saver.current?.save() ?? Promise.resolve(),
+    );
   }
   const latest = backups.filter(
     (backup, index, all) =>
@@ -831,8 +855,10 @@ export function useCloudBackups(
               Choose another saved copy
             </button>
             <p className="small muted backup-note">
-              Use one active copy of a restored wallet to avoid competing
-              payments. Backups do not extend token deadlines.
+              {client?.user.provider === "google"
+                ? "Google Drive keeps connected copies synchronized. Competing payments can still be rejected by the mint."
+                : "Use one active copy of a restored wallet to avoid competing payments."}{" "}
+              Backups do not extend token deadlines.
             </p>
           </form>
         )}
@@ -854,7 +880,9 @@ export function useCloudBackups(
                 disabled={working}
                 onClick={() =>
                   void action(async () => {
-                    await saver.current?.save();
+                    await synchronizeRef.current(
+                      () => saver.current?.save() ?? Promise.resolve(),
+                    );
                   })
                 }
               >
@@ -950,7 +978,9 @@ export function useCloudBackups(
                   disabled={working || progress.saving}
                   onClick={() =>
                     void action(async () => {
-                      await saver.current?.save(true);
+                      await synchronizeRef.current(
+                        () => saver.current?.save(true) ?? Promise.resolve(),
+                      );
                     }, true)
                   }
                 >
@@ -973,7 +1003,9 @@ export function useCloudBackups(
                   onClick={() =>
                     void action(async () => {
                       await pauseCloud();
-                      await saver.current?.save();
+                      await synchronizeRef.current(
+                        () => saver.current?.save() ?? Promise.resolve(),
+                      );
                     }, true)
                   }
                 >
@@ -1101,5 +1133,22 @@ export function useCloudBackups(
       </span>
     </button>
   ) : null;
-  return { settings, prompt, entry };
+  return {
+    settings,
+    prompt,
+    entry,
+    client,
+    saveNow: async () => {
+      const settings = await readCloudSettings();
+      if (!client || settings?.account !== client.user.account)
+        throw new Error("Enable Google Drive backups before synchronizing.");
+      if (!saver.current)
+        return Promise.reject(
+          new Error(
+            "Reconnect Google and enable wallet backups before synchronizing.",
+          ),
+        );
+      return saver.current.flush();
+    },
+  };
 }

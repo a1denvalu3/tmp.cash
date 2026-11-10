@@ -1,4 +1,4 @@
-import type { Table } from "dexie";
+import type { Table, Transaction } from "dexie";
 import { IdbDb } from "../lib/db";
 import type {
   TmpCashRepository,
@@ -10,7 +10,15 @@ import type {
   TmpCashProofState,
 } from "coco-cashu-core/tmp-cash";
 import { validateTmpCashState } from "./validation";
-import { psPreimageHash } from "@cashu/cashu-ts/tmp-cash";
+import { psNullifier, psPreimageHash } from "@cashu/cashu-ts/tmp-cash";
+
+import {
+  emptyWalletState,
+  canonical,
+  projectSyncFacts,
+  validateSyncFact,
+  type WalletSyncFact,
+} from "./sync";
 
 /** Separate PS schema: standard Coco secp256k1 proof tables are never reinterpreted. */
 export class TmpCashIndexedDbRepository
@@ -21,6 +29,8 @@ export class TmpCashIndexedDbRepository
   operations!: Table<TmpCashOperation, string>;
   fundings!: Table<TmpCashFunding, string>;
   activity!: Table<TmpCashActivity, string>;
+  syncFacts!: Table<WalletSyncFact, string>;
+  syncData!: Table<{ id: string; value: unknown }, string>;
   // Keep the existing database identity so upgrades retain funds and operations.
   constructor(name = "cashu_layer3_wallet_v3") {
     super({ name });
@@ -30,6 +40,87 @@ export class TmpCashIndexedDbRepository
       fundings: "id,mint,state",
       activity: "id,mint,createdAt",
     });
+    this.version(2).stores({ syncFacts: "id", syncData: "id" });
+  }
+  override runTransaction<T>(
+    mode: "r" | "rw",
+    stores: string[],
+    fn: (tx: Transaction) => Promise<T>,
+  ): Promise<T> {
+    return super.runTransaction(
+      mode,
+      mode === "rw"
+        ? [
+            ...new Set([
+              ...stores,
+              "proofs",
+              "operations",
+              "fundings",
+              "activity",
+              "syncFacts",
+              "syncData",
+            ]),
+          ]
+        : stores,
+      fn,
+    );
+  }
+  private async journal(
+    state: TmpCashState,
+    terminal?: WalletSyncFact["terminal"],
+    consumed?: WalletSyncFact["consumed"],
+  ) {
+    if (await this.syncData.get("journal"))
+      await this.syncFacts.add({
+        id: crypto.randomUUID(),
+        state: structuredClone(state),
+        ...(terminal ? { terminal } : {}),
+        ...(consumed ? { consumed } : {}),
+      });
+  }
+  async enableSyncJournal(): Promise<void> {
+    await this.runTransaction(
+      "rw",
+      ["proofs", "operations", "fundings", "activity"],
+      async () => {
+        if (await this.syncData.get("journal")) return;
+        await this.syncData.put({ id: "journal", value: true });
+        await this.journal(await this.read());
+      },
+    );
+  }
+  async readSyncFacts(): Promise<WalletSyncFact[]> {
+    return this.syncFacts.toArray();
+  }
+  async mergeSyncFacts(input: WalletSyncFact[]): Promise<void> {
+    const facts = input.map(validateSyncFact);
+    await this.runTransaction(
+      "rw",
+      ["proofs", "operations", "fundings", "activity"],
+      async () => {
+        for (const fact of facts) {
+          const previous = await this.syncFacts.get(fact.id);
+          if (previous && canonical(previous) !== canonical(fact))
+            throw new Error("Sync fact identity was reused");
+          if (!previous) await this.syncFacts.add(fact);
+        }
+        await this.projectJournal();
+      },
+    );
+  }
+  private async projectJournal() {
+    const state = projectSyncFacts(
+      await this.read(),
+      await this.syncFacts.toArray(),
+    );
+    await this.proofs.clear();
+    await this.operations.clear();
+    await this.fundings.clear();
+    await this.activity.clear();
+    await this.proofs.bulkPut(state.proofs);
+    await this.operations.bulkPut(state.operations);
+    await this.fundings.bulkPut(state.fundings);
+    await this.activity.bulkPut(state.activity);
   }
   async read(): Promise<TmpCashState> {
     return this.runTransaction(
@@ -44,10 +135,18 @@ export class TmpCashIndexedDbRepository
     );
   }
   async saveFunding(f: TmpCashFunding): Promise<void> {
-    await this.fundings.add(f);
+    await this.runTransaction("rw", ["fundings"], async () => {
+      await this.fundings.add(f);
+      await this.journal({ ...emptyWalletState(), fundings: [f] });
+    });
   }
   async updateFunding(f: TmpCashFunding): Promise<void> {
-    await this.fundings.put(f);
+    await this.runTransaction("rw", ["fundings"], async () => {
+      const previous = await this.fundings.get(f.id);
+      await this.fundings.put(f);
+      if (canonical(previous) !== canonical(f))
+        await this.journal({ ...emptyWalletState(), fundings: [f] });
+    });
   }
   async reserve(
     op: TmpCashOperation,
@@ -93,6 +192,15 @@ export class TmpCashIndexedDbRepository
         await this.proofs.put({ ...p, state: "reserved", operationId: op.id });
       }
       await this.operations.add(op);
+      await this.journal({
+        ...emptyWalletState(),
+        operations: [op],
+        proofs: inputs.map((p) => ({
+          ...p,
+          state: "reserved",
+          operationId: op.id,
+        })),
+      });
     });
   }
   async reserveMany(
@@ -117,10 +225,14 @@ export class TmpCashIndexedDbRepository
       async () => {
         if (!(await this.operations.get(op.id)))
           throw new Error("Unknown saved operation");
-        const inputs = await this.proofs
-          .where("operationId")
-          .equals(op.id)
-          .toArray();
+        const inputs =
+          op.payload.kind === "mint"
+            ? []
+            : (
+                await this.proofs.bulkGet(
+                  op.payload.token.proofs.map(psNullifier),
+                )
+              ).filter((p): p is TmpCashProofRecord => !!p);
         for (const p of inputs)
           await this.proofs.put({ ...p, state: "spent", operationId: null });
         for (const p of proofs) {
@@ -134,6 +246,32 @@ export class TmpCashIndexedDbRepository
         }
         await this.activity.add(activity);
         await this.operations.delete(op.id);
+        const funding =
+          op.payload.kind === "mint"
+            ? await this.fundings.get(op.payload.quote.payment_hash)
+            : null;
+        await this.journal(
+          {
+            ...emptyWalletState(),
+            fundings: funding ? [funding] : [],
+            proofs: [
+              ...inputs.map((p) => ({
+                ...p,
+                state: "spent" as const,
+                operationId: null,
+              })),
+              ...proofs,
+            ],
+            activity: [activity],
+          },
+          undefined,
+          {
+            id: op.id,
+            inputs: inputs.map((p) => p.id),
+            quote: op.payload.kind === "mint" ? op.payload.quote.quote : null,
+          },
+        );
+        if (await this.syncData.get("journal")) await this.projectJournal();
       },
     );
   }
@@ -159,6 +297,16 @@ export class TmpCashIndexedDbRepository
         });
       }
       await this.operations.delete(op.id);
+      await this.journal(
+        {
+          ...emptyWalletState(),
+          proofs: (await this.proofs.bulkGet(inputs.map((p) => p.id))).filter(
+            (p): p is TmpCashProofRecord => !!p,
+          ),
+        },
+        { id: op.id, state: "released" },
+      );
+      if (await this.syncData.get("journal")) await this.projectJournal();
     });
   }
   async expire(op: TmpCashOperation): Promise<void> {
@@ -189,6 +337,16 @@ export class TmpCashIndexedDbRepository
         });
       }
       await this.operations.delete(op.id);
+      await this.journal(
+        {
+          ...emptyWalletState(),
+          proofs: (await this.proofs.bulkGet(inputs.map((p) => p.id))).filter(
+            (p): p is TmpCashProofRecord => !!p,
+          ),
+        },
+        { id: op.id, state: "expired" },
+      );
+      if (await this.syncData.get("journal")) await this.projectJournal();
     });
   }
   async setError(id: string, error: string): Promise<void> {
@@ -214,6 +372,11 @@ export class TmpCashIndexedDbRepository
               ? { expiredAt: expiredAt ?? observedAt }
               : {}),
           });
+          if (state === "spent")
+            await this.journal({
+              ...emptyWalletState(),
+              proofs: [{ ...record, state, operationId: null }],
+            });
         }
       }
     });
@@ -233,6 +396,10 @@ export class TmpCashIndexedDbRepository
         throw new Error("Backing is unknown or has a pending operation");
       for (const p of proofs)
         await this.proofs.put({ ...p, proof: { ...p.proof, preimage } });
+      await this.journal({
+        ...emptyWalletState(),
+        proofs: proofs.map((p) => ({ ...p, proof: { ...p.proof, preimage } })),
+      });
     });
   }
   async importState(input: TmpCashState): Promise<void> {
@@ -255,6 +422,7 @@ export class TmpCashIndexedDbRepository
         await this.operations.bulkAdd(state.operations);
         await this.fundings.bulkAdd(state.fundings);
         await this.activity.bulkAdd(state.activity);
+        await this.journal(state);
       },
     );
   }

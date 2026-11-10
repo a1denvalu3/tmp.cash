@@ -10,6 +10,7 @@ export interface CloudBackup {
   name: string;
   updated: number;
   encrypted: boolean;
+  writer?: string;
 }
 export interface CloudClient {
   user: CloudUser;
@@ -21,6 +22,7 @@ export interface CloudClient {
     created: number,
     payload: string,
     name: string,
+    writer?: string,
   ): Promise<CloudBackup>;
   remove(id: string): Promise<void>;
   disconnect(): Promise<void>;

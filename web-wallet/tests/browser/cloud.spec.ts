@@ -1,6 +1,6 @@
 import { test, expect, type BrowserContext, type Page } from "@playwright/test";
 import { psInvoiceDetails } from "@cashu/cashu-ts/tmp-cash";
-import { encryptBackup } from "../../src/backup";
+import { encryptBackup, decryptBackup } from "../../src/backup";
 
 test.skip(
   process.env.WALLET_E2E_CLOUD !== "1",
@@ -631,7 +631,7 @@ test("reconnects an expired Google session without repeating password setup", as
   ).toBe(1);
 });
 
-test("lets the user keep using the wallet while the first backup is still saving", async ({
+test("keeps the wallet navigable while new funding waits for the first sync backup", async ({
   page,
   context,
 }) => {
@@ -664,10 +664,97 @@ test("lets the user keep using the wallet while the first backup is still saving
   await expect(
     page.getByRole("button", { name: "Wallet backup is on" }),
   ).toHaveCount(0);
-  await fund(page, 4);
+  let quotePosts = 0;
+  page.on("request", (request) => {
+    if (
+      request.url() === mintUrl + "/v1/mint/quote/bolt11" &&
+      request.method() === "POST"
+    )
+      quotePosts++;
+  });
+  const funding = fund(page, 4);
+  await expect(
+    page.getByRole("button", { name: "Create funding invoice" }),
+  ).toBeDisabled();
+  expect(quotePosts).toBe(0);
   release();
+  await funding;
   await expect
     .poll(() => state.files.size, { timeout: 12000 })
     .toBeGreaterThan(1);
   expect(state.mintLeaks).toEqual([]);
+});
+
+test("synchronizes active devices through the Drive backup document without contacting Nostr", async ({
+  page,
+  context,
+  browser,
+}) => {
+  const state = providerState();
+  const sockets: string[] = [];
+  page.on("websocket", (socket) => sockets.push(socket.url()));
+  await providers(context, state);
+  await welcome(page);
+  await signIn(page);
+  await chooseProtection(page, true, "Shared Drive wallet");
+  await finish(page);
+  await fund(page, 16);
+  await expect
+    .poll(
+      async () => {
+        const latest = [...state.files.values()].sort(
+          (a, b) =>
+            Number(b.appProperties.created) - Number(a.appProperties.created),
+        )[0];
+        const data = await decryptBackup(latest.payload, passphrase);
+        return data.state.proofs
+          .filter((p) => p.state === "ready")
+          .reduce((n, p) => n + p.proof.amount, 0);
+      },
+      { timeout: 12000 },
+    )
+    .toBe(16);
+  const fresh = await browser.newContext();
+  fresh.on("page", (p) =>
+    p.on("websocket", (socket) => sockets.push(socket.url())),
+  );
+  try {
+    await providers(fresh, state);
+    const other = await fresh.newPage();
+    await welcome(other);
+    await signIn(other);
+    await other
+      .getByRole("button", { name: /Shared Drive wallet/ })
+      .first()
+      .click();
+    await other.getByLabel("Backup password", { exact: true }).fill(passphrase);
+    await other.getByRole("button", { name: "Restore my wallet" }).click();
+    await expect(
+      other.getByRole("dialog", { name: "Your wallet is backed up." }),
+    ).toBeVisible();
+    await other.getByRole("button", { name: "Back to my wallet" }).click();
+    await expect(other.getByTestId("balance")).toHaveText("16sats");
+    await fund(page, 8);
+    await expect(other.getByTestId("balance")).toHaveText("24sats", {
+      timeout: 20000,
+    });
+    await fund(other, 4);
+    await expect(page.getByTestId("balance")).toHaveText("28sats", {
+      timeout: 20000,
+    });
+    await page.reload();
+    await other.reload();
+    await expect(page.getByTestId("balance")).toHaveText("28sats");
+    await expect(other.getByTestId("balance")).toHaveText("28sats");
+    expect(
+      sockets.filter((url) => new URL(url).host !== new URL(page.url()).host),
+    ).toEqual([]);
+    const groups = new Set(
+      [...state.files.values()].map((file) => file.appProperties.walletId),
+    );
+    expect(groups.size).toBe(1);
+    expect(state.mintLeaks).toEqual([]);
+  } finally {
+    await fresh.close();
+  }
 });

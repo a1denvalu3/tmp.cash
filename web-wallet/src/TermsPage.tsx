@@ -102,8 +102,10 @@ export function TermsPage() {
           Automatic saves run while the wallet is open and connected, with valid
           provider access. A backup can recover only the state that was
           successfully saved. It cannot recover later changes or make expired or
-          spent tokens usable. Use one active copy of a restored wallet to avoid
-          competing payments from the same funds.
+          spent tokens usable. Connected Google Drive copies and enabled Nostr
+          device sync merge wallet changes eventually; competing payments may be
+          rejected by the mint. Without device sync, use one active copy of a
+          restored wallet to avoid competing payments from the same funds.
         </p>
       </section>
       <section aria-labelledby="terms-fees-title">

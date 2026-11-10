@@ -68,6 +68,24 @@ export function PrivacyPage() {
           .
         </p>
       </section>
+      <section aria-labelledby="sync-title">
+        <h2 id="sync-title">Optional device synchronization</h2>
+        <p>
+          Google Drive backups can contain a mergeable synchronization document,
+          including saved payment requests and recovery secrets, protected by
+          the backup option you choose. Devices connected to the same wallet
+          merge these changes through Drive.
+        </p>
+        <p>
+          Without a Google session, enabled device sync uses buzz.cashu.space or
+          the relays you select. Wallet data is encrypted and signed in your
+          browser. Relays can see your connection address, a dedicated sync
+          public key, event sizes, and publication times. Authentication uses
+          that sync key, not your Google or Apple credentials. Anyone with your
+          private sync code can decrypt and spend the wallet. Pausing sync does
+          not revoke that code or guarantee deletion of existing relay copies.
+        </p>
+      </section>
       <section aria-labelledby="apple-title">
         <h2 id="apple-title">Optional iCloud backups</h2>
         <p>

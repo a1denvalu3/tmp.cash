@@ -35,3 +35,11 @@ The PS port derives from `tmp_cash/crypto/ps.py`, `tmp_cash/keyset.py`, `tmp_cas
 and `tmp_cash/client.py` in this repository. See the repository's root
 `PROVENANCE.md` for its original cashu-nft attribution. The wallet app and these
 changes are covered by the root MIT license.
+
+Device synchronization uses pinned, unmodified `yjs` (13.6.33, MIT) for document
+updates and merging, and `nostr-tools` (2.26.0, Unlicense) for relay communication,
+event signatures, NIP-42 authentication, and NIP-44 encryption. These are normal
+npm dependencies recorded in the lockfile. The wallet-specific immutable recovery
+fragments, mint-outcome projection, Drive backup integration, and relay checkpoint
+adapter are local code. No source from the experimental `nostr-crdt` provider is
+vendored or copied.

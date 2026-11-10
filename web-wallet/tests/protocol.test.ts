@@ -17,6 +17,10 @@ import {
 import { TmpCashManager } from "coco-cashu-core/tmp-cash";
 import { TmpCashIndexedDbRepository } from "coco-cashu-indexeddb/tmp-cash";
 import { denominationKeysetId } from "../packages/cashu-ts/src/tmp-cash/crypto";
+import {
+  createWalletSyncBackup,
+  mergeWalletSyncBackup,
+} from "../src/sync-document";
 import { expiredBackings } from "../src/backings";
 import { decryptBackup, encryptBackup } from "../src/backup";
 
@@ -1468,5 +1472,213 @@ describe("Coco operation journal and IndexedDB", () => {
         htlcs: [{ ...heightSnapshot.htlcs[0], blocks_remaining: 6 }],
       }),
     ).toThrow("deadline");
+  });
+});
+
+describe("multi-device wallet recovery and conflict resolution", () => {
+  async function funded(value = 16, fetcher?: typeof fetch) {
+    const repo = repository(),
+      manager = new TmpCashManager(repo, mintUrl, fetcher);
+    await manager.init();
+    await createWalletSyncBackup(repo, mintUrl);
+    const funding = await manager.createFunding(value);
+    await control("accept", { payment_hash: funding.id });
+    await manager.pollFunding(funding.id);
+    return { repo, manager, funding };
+  }
+  async function clone(source: TmpCashIndexedDbRepository) {
+    const checkpoint = await createWalletSyncBackup(source, mintUrl);
+    const repo = repository(),
+      manager = new TmpCashManager(repo, mintUrl);
+    await manager.init();
+    await manager.synchronize(() => mergeWalletSyncBackup(repo, checkpoint));
+    return { repo, manager };
+  }
+  async function exchange(
+    a: { repo: TmpCashIndexedDbRepository; manager: TmpCashManager },
+    b: { repo: TmpCashIndexedDbRepository; manager: TmpCashManager },
+  ) {
+    const left = await createWalletSyncBackup(a.repo, mintUrl),
+      right = await createWalletSyncBackup(b.repo, mintUrl);
+    await a.manager.synchronize(() => mergeWalletSyncBackup(a.repo, right));
+    await b.manager.synchronize(() => mergeWalletSyncBackup(b.repo, left));
+  }
+  function gate(a: TmpCashManager, b: TmpCashManager) {
+    let arrived = 0,
+      release!: () => void;
+    const barrier = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const wait = async () => {
+      if (++arrived === 2) release();
+      await barrier;
+    };
+    a.setSyncBarrier(wait);
+    b.setSyncBarrier(wait);
+  }
+  it("converges competing spends to the mint's winner without resurrecting inputs or change", async () => {
+    const a = await funded(),
+      b = await clone(a.repo);
+    gate(a.manager, b.manager);
+    const results = await Promise.allSettled([
+      a.manager.send(8),
+      b.manager.send(8),
+    ]);
+    expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+    a.manager.setSyncBarrier(null);
+    b.manager.setSyncBarrier(null);
+    await exchange(a, b);
+    expect((await a.manager.view()).balance).toBe(8);
+    expect((await b.manager.view()).balance).toBe(8);
+    expect((await a.manager.view()).sent).toBe(8);
+    expect((await b.manager.view()).sent).toBe(8);
+    expect((await a.repo.read()).operations).toEqual([]);
+    expect((await b.repo.read()).operations).toEqual([]);
+    const stale = await createWalletSyncBackup(b.repo, mintUrl);
+    const recipient = new TmpCashManager(repository(), mintUrl);
+    await recipient.init();
+    const sent = results.find(
+      (r): r is PromiseFulfilledResult<string> => r.status === "fulfilled",
+    )!.value;
+    await recipient.receive(sent);
+    await a.manager.refresh();
+    await a.manager.synchronize(() => mergeWalletSyncBackup(a.repo, stale));
+    expect((await a.manager.view()).balance).toBe(8);
+    expect((await a.manager.view()).sent).toBe(0);
+  });
+  it("merges two successful spends using independent inputs", async () => {
+    const a = await funded(),
+      b = await clone(a.repo);
+    const extra = await b.manager.createFunding(16);
+    await control("accept", { payment_hash: extra.id });
+    await b.manager.pollFunding(extra.id);
+    await exchange(a, b);
+    await Promise.all([
+      a.manager.send(8, a.funding.id),
+      b.manager.send(8, extra.id),
+    ]);
+    await exchange(a, b);
+    expect((await a.manager.view()).balance).toBe(16);
+    expect((await b.manager.view()).balance).toBe(16);
+    expect((await a.manager.view()).sent).toBe(16);
+    expect((await b.manager.view()).sent).toBe(16);
+    expect(
+      (await a.repo.read()).activity.filter((r) => r.purpose === "send"),
+    ).toHaveLength(2);
+  });
+  it("recovers a lost swap response on another device using the exact saved request", async () => {
+    let lose = true;
+    const requests: string[] = [];
+    const fetcher: typeof fetch = async (input, init) => {
+      const response = await fetch(input, init);
+      if (String(input).endsWith("/v1/swap")) {
+        requests.push(String(init?.body));
+        if (lose) {
+          lose = false;
+          throw new Error("lost swap response");
+        }
+      }
+      return response;
+    };
+    const a = await funded(16, fetcher);
+    await expect(a.manager.send(8)).rejects.toThrow("lost swap");
+    const b = await clone(a.repo),
+      operation = (await b.repo.read()).operations[0];
+    const recovered = await b.manager.retry(operation.id);
+    expect(recovered.token).toBeTruthy();
+    await exchange(a, b);
+    expect((await a.manager.view()).balance).toBe(8);
+    expect((await b.manager.view()).balance).toBe(8);
+    expect((await a.repo.read()).operations).toEqual([]);
+    // Replaying on the original device cannot create a second outgoing transfer.
+    expect(
+      (await a.repo.read()).activity.filter((r) => r.purpose === "send"),
+    ).toHaveLength(1);
+    expect(requests).toHaveLength(1);
+  });
+  it("never posts a spending request if write-ahead synchronization fails", async () => {
+    let posts = 0;
+    const fetcher: typeof fetch = async (input, init) => {
+      if (String(input).endsWith("/v1/swap")) posts++;
+      return fetch(input, init);
+    };
+    const a = await funded(16, fetcher);
+    a.manager.setSyncBarrier(async () => {
+      throw new Error("sync unavailable");
+    });
+    await expect(a.manager.send(8)).rejects.toThrow("sync unavailable");
+    expect(posts).toBe(0);
+    expect((await a.repo.read()).operations).toHaveLength(1);
+    a.manager.setSyncBarrier(null);
+    await a.manager.retry((await a.repo.read()).operations[0].id);
+    expect(posts).toBe(1);
+  });
+  it("resolves two issuance requests against the same funded quote", async () => {
+    const repo = repository(),
+      manager = new TmpCashManager(repo, mintUrl);
+    await manager.init();
+    await createWalletSyncBackup(repo, mintUrl);
+    const funding = await manager.createFunding(16);
+    const a = { repo, manager },
+      b = await clone(repo);
+    await control("accept", { payment_hash: funding.id });
+    gate(a.manager, b.manager);
+    const results = await Promise.allSettled([
+      a.manager.pollFunding(funding.id),
+      b.manager.pollFunding(funding.id),
+    ]);
+    expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+    a.manager.setSyncBarrier(null);
+    b.manager.setSyncBarrier(null);
+    await exchange(a, b);
+    expect((await a.manager.view()).balance).toBe(16);
+    expect((await b.manager.view()).balance).toBe(16);
+    expect((await a.repo.read()).operations).toEqual([]);
+    expect((await b.repo.read()).operations).toEqual([]);
+  });
+  it("does not revive a released request when an older checkpoint returns", async () => {
+    const a = await funded();
+    const { request } = await control("receiver", { amount: 8 });
+    const quote = await a.manager.meltQuote(request);
+    await control("expire-melt-quote", { quote: quote.quote });
+    let stale: Awaited<ReturnType<typeof createWalletSyncBackup>>;
+    a.manager.setSyncBarrier(async () => {
+      stale = await createWalletSyncBackup(a.repo, mintUrl);
+    });
+    await expect(a.manager.melt(quote)).rejects.toThrow("expired");
+    a.manager.setSyncBarrier(null);
+    expect((await a.repo.read()).operations).toEqual([]);
+    await a.manager.synchronize(() => mergeWalletSyncBackup(a.repo, stale!));
+    expect((await a.repo.read()).operations).toEqual([]);
+    expect((await a.manager.view()).balance).toBe(16);
+  });
+  it("rolls back proof reservations when the recovery journal cannot be committed", async () => {
+    let posts = 0;
+    const fetcher: typeof fetch = async (input, init) => {
+      if (String(input).endsWith("/v1/swap")) posts++;
+      return fetch(input, init);
+    };
+    const a = await funded(16, fetcher);
+    const fail = () => {
+      throw new Error("journal storage failed");
+    };
+    a.repo.syncFacts.hook("creating", fail);
+    await expect(a.manager.send(8)).rejects.toThrow("journal storage failed");
+    a.repo.syncFacts.hook("creating").unsubscribe(fail);
+    expect(posts).toBe(0);
+    expect((await a.repo.read()).operations).toEqual([]);
+    expect((await a.manager.view()).balance).toBe(16);
+  });
+  it("preserves payment success if the completion checkpoint cannot be uploaded", async () => {
+    const a = await funded();
+    let calls = 0;
+    a.manager.setSyncBarrier(async () => {
+      if (++calls === 2) throw new Error("completion upload unavailable");
+    });
+    const token = await a.manager.send(8);
+    expect(psTokenAmount(decodePSToken(token))).toBe(8);
+    expect(calls).toBe(2);
+    expect((await a.repo.read()).operations).toEqual([]);
+    expect((await a.manager.view()).balance).toBe(8);
   });
 });

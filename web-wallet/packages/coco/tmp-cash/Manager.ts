@@ -33,6 +33,21 @@ import type {
 export class TmpCashManager {
   readonly events = new EventBus<{ change: undefined }>();
   readonly wallet: PSWallet;
+  private syncBarrier: (() => Promise<void>) | null = null;
+  setSyncBarrier(barrier: (() => Promise<void>) | null) {
+    this.syncBarrier = barrier;
+  }
+  synchronize(apply: () => Promise<void>): Promise<void> {
+    return this.exclusive(async () => {
+      this.verifiedAt = 0;
+      try {
+        await apply();
+      } finally {
+        await this.changed();
+      }
+      await this.refreshUnlocked();
+    });
+  }
   private snapshot: PSSnapshot | null = null;
   private verifiedAt = 0;
   private verifiedProofs = new Set<string>();
@@ -239,6 +254,7 @@ export class TmpCashManager {
       // Preserve the preimage before the first remote POST, including a lost quote response.
       await this.repo.saveFunding(funding);
       await this.changed();
+      await this.syncBarrier?.();
       funding.quote = await this.wallet.createMintQuote(
         value,
         funding.id,
@@ -487,6 +503,11 @@ export class TmpCashManager {
   }
   private async execute(op: TmpCashOperation): Promise<TmpCashActivity> {
     try {
+      await this.syncBarrier?.();
+      const previous = (await this.repo.read()).activity.find(
+        (row) => row.id === op.id,
+      );
+      if (previous) return previous;
       const activity: TmpCashActivity = {
         id: op.id,
         mint: op.mint,
@@ -553,6 +574,13 @@ export class TmpCashManager {
       };
       await this.repo.complete(op, proofs, activity);
       await this.changed();
+      // Persist completed outputs promptly. The acknowledged prepare record still
+      // permits exact-request recovery if this follow-up upload is unavailable.
+      try {
+        await this.syncBarrier?.();
+      } catch {
+        /* A mint-confirmed payment remains successful. */
+      }
       // A successful receipt remains successful even when the follow-up snapshot is offline.
       try {
         await this.refreshUnlocked();
