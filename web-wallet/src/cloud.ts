@@ -3,8 +3,13 @@ import {
   encryptBackupWithKey,
   plaintextBackup,
   type BackupKey,
+  restoreBackupWithKey,
 } from "./backup";
-import { CloudError, type CloudClient } from "./CloudTypes";
+import type { WalletSyncBackup } from "./sync-document";
+import { createWalletSyncBackup, mergeWalletSyncBackup } from "./sync-document";
+import type { TmpCashIndexedDbRepository } from "coco-cashu-indexeddb/tmp-cash";
+import { readSyncSettings } from "./nostr-sync";
+import { CloudError, type CloudClient, type CloudBackup } from "./CloudTypes";
 export type {
   CloudBackup,
   CloudUser,
@@ -97,6 +102,20 @@ export class CloudSaver {
   stop() {
     this.stopped = true;
   }
+  async flush(): Promise<void> {
+    await this.save();
+    const settings = await readCloudSettings();
+    if (
+      this.stopped ||
+      settings?.account !== this.client.user.account ||
+      settings.pending ||
+      !settings.fingerprint
+    ) {
+      throw new CloudError(
+        "Wallet synchronization stopped before recovery data was confirmed. Reconnect and retry.",
+      );
+    }
+  }
   save(force = false): Promise<void> {
     if (this.running) return this.running;
     this.running = cloudLock(async () => {
@@ -118,13 +137,47 @@ export class CloudSaver {
             encrypted: !!settings.encryption,
             updated: settings.updated,
           };
-          const state = await this.repo.read(),
-            mint = this.mint();
+          const mint = this.mint();
+          let sync: WalletSyncBackup | undefined;
+          const syncRepo =
+            this.client.user.provider === "google" &&
+            "enableSyncJournal" in this.repo
+              ? (this.repo as TmpCashIndexedDbRepository)
+              : null;
+          let files: CloudBackup[] = [];
+          if (syncRepo) {
+            await syncRepo.enableSyncJournal();
+            files = (await this.client.list()).filter(
+              (file) => file.walletId === settings!.id,
+            );
+            const seenKey = `drive-seen:${settings.account}:${settings.id}`;
+            const seen = new Set(
+              ((await syncRepo.syncData.get(seenKey))?.value as string[]) ?? [],
+            );
+            for (const file of files) {
+              // Legacy snapshots have no shared CRDT identity; they remain available for explicit restore.
+              if (seen.has(file.id) || !file.writer) continue;
+              const data = await restoreBackupWithKey(
+                await this.client.download(file.id),
+                settings.encryption,
+              );
+              if (data.sync) await mergeWalletSyncBackup(syncRepo, data.sync);
+              seen.add(file.id);
+            }
+            await syncRepo.syncData.put({
+              id: seenKey,
+              value: files.map((file) => file.id).filter((id) => seen.has(id)),
+            });
+            sync = await createWalletSyncBackup(syncRepo, mint);
+          }
+          const state = await this.repo.read();
           const fingerprint = Array.from(
             new Uint8Array(
               await crypto.subtle.digest(
                 "SHA-256",
-                new TextEncoder().encode(JSON.stringify({ state, mint })),
+                new TextEncoder().encode(
+                  JSON.stringify({ state, mint, ...(sync ? { sync } : {}) }),
+                ),
               ),
             ),
             (n) => n.toString(16).padStart(2, "0"),
@@ -153,8 +206,13 @@ export class CloudSaver {
               created: Date.now(),
               fingerprint,
               payload: settings.encryption
-                ? await encryptBackupWithKey(state, mint, settings.encryption)
-                : plaintextBackup(state, mint),
+                ? await encryptBackupWithKey(
+                    state,
+                    mint,
+                    settings.encryption,
+                    sync,
+                  )
+                : plaintextBackup(state, mint, sync),
             };
           if (!settings.pending) {
             settings = { ...settings, pending };
@@ -167,6 +225,7 @@ export class CloudSaver {
             pending.created,
             pending.payload,
             settings.name,
+            syncRepo ? (await readSyncSettings(syncRepo))?.device : undefined,
           );
           settings = {
             ...settings,
@@ -175,6 +234,20 @@ export class CloudSaver {
             fingerprint: pending.fingerprint,
           };
           await writeSettings(settings);
+          if (syncRepo) {
+            const writer = (await readSyncSettings(syncRepo))?.device;
+            // Retain the current and previous checkpoint per writer. Other devices' files are untouched.
+            const own = files
+              .filter((file) => file.writer === writer && file.id !== result.id)
+              .sort((a, b) => b.updated - a.updated);
+            for (const old of own.slice(1)) {
+              try {
+                await this.client.remove(old.id);
+              } catch {
+                /* Retry cleanup on the next successful save. */
+              }
+            }
+          }
           if (pass === 0 && pending.fingerprint !== fingerprint) continue;
           if (!this.stopped)
             this.report({

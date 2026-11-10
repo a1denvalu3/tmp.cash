@@ -1,5 +1,9 @@
 import { validateTmpCashState } from "coco-cashu-indexeddb/tmp-cash";
 import { normalizePSMintUrl } from "@cashu/cashu-ts/tmp-cash";
+import {
+  validateWalletSyncBackup,
+  type WalletSyncBackup,
+} from "./sync-document";
 import type { TmpCashState } from "coco-cashu-core/tmp-cash";
 
 export const MAX_BACKUP_LENGTH = 16_000_000;
@@ -37,15 +41,19 @@ export interface BackupKey {
   key: CryptoKey;
   salt: Uint8Array<ArrayBuffer>;
 }
-export async function createBackupKey(password: string): Promise<BackupKey> {
-  const salt = crypto.getRandomValues(new Uint8Array(16));
+export async function createBackupKey(
+  password: string,
+  salt = crypto.getRandomValues(new Uint8Array(16)),
+): Promise<BackupKey> {
+  if (salt.length !== 16) throw new Error("Invalid backup salt");
   return { key: await key(password, salt), salt };
 }
-function contents(state: TmpCashState, mint: string) {
+function contents(state: TmpCashState, mint: string, sync?: WalletSyncBackup) {
   return {
     version: 1,
     mint: normalizePSMintUrl(mint),
     state: validateTmpCashState(state),
+    ...(sync ? { sync: validateWalletSyncBackup(sync) } : {}),
   };
 }
 function checked(raw: string) {
@@ -53,9 +61,16 @@ function checked(raw: string) {
     throw new Error("Wallet state is too large for a restorable backup");
   return raw;
 }
-export function plaintextBackup(state: TmpCashState, mint: string): string {
+export function plaintextBackup(
+  state: TmpCashState,
+  mint: string,
+  sync?: WalletSyncBackup,
+): string {
   return checked(
-    JSON.stringify({ format: "tmp-cash-plaintext", ...contents(state, mint) }),
+    JSON.stringify({
+      format: "tmp-cash-plaintext",
+      ...contents(state, mint, sync),
+    }),
   );
 }
 export function isEncryptedBackup(raw: string): boolean {
@@ -75,23 +90,31 @@ export async function restoreBackup(raw: string, password = "") {
   return {
     mint: normalizePSMintUrl(data.mint),
     state: validateTmpCashState(data.state),
+    ...(data.sync ? { sync: validateWalletSyncBackup(data.sync) } : {}),
   };
 }
 export async function encryptBackup(
   state: TmpCashState,
   mint: string,
   password: string,
+  sync?: WalletSyncBackup,
 ): Promise<string> {
-  return encryptBackupWithKey(state, mint, await createBackupKey(password));
+  return encryptBackupWithKey(
+    state,
+    mint,
+    await createBackupKey(password),
+    sync,
+  );
 }
 export async function encryptBackupWithKey(
   state: TmpCashState,
   mint: string,
   backupKey: BackupKey,
+  sync?: WalletSyncBackup,
 ): Promise<string> {
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const encoded = new TextEncoder().encode(
-    checked(JSON.stringify(contents(state, mint))),
+    checked(JSON.stringify(contents(state, mint, sync))),
   );
   const ciphertext = await crypto.subtle.encrypt(
     {
@@ -116,7 +139,8 @@ export async function encryptBackupWithKey(
 export async function decryptBackup(
   raw: string,
   password: string,
-): Promise<{ mint: string; state: TmpCashState }> {
+  backupKey?: BackupKey,
+): Promise<{ mint: string; state: TmpCashState; sync?: WalletSyncBackup }> {
   if (raw.length > MAX_BACKUP_LENGTH)
     throw new Error("Backup file is too large");
   const envelope = JSON.parse(raw);
@@ -142,7 +166,7 @@ export async function decryptBackup(
         iv,
         additionalData: new TextEncoder().encode("cashu-layer3-backup-v1"),
       },
-      await key(password, salt),
+      backupKey ? backupKey.key : await key(password, salt),
       fromBase64(envelope.ciphertext),
     );
   } catch {
@@ -156,5 +180,26 @@ export async function decryptBackup(
   return {
     mint: normalizePSMintUrl(contents.mint),
     state: validateTmpCashState(contents.state),
+    ...(contents.sync ? { sync: validateWalletSyncBackup(contents.sync) } : {}),
   };
+}
+
+export async function restoreBackupWithKey(
+  raw: string,
+  backupKey: BackupKey | null,
+) {
+  if (!isEncryptedBackup(raw)) return restoreBackup(raw);
+  if (!backupKey)
+    throw new Error(
+      "This wallet uses password-protected sync. Restore it with its backup password first.",
+    );
+  return decryptBackup(raw, "", backupKey);
+}
+export async function recoverBackupKey(
+  raw: string,
+  password: string,
+): Promise<BackupKey> {
+  const data = JSON.parse(raw);
+  if (typeof data.salt !== "string") throw new Error("Invalid backup salt");
+  return createBackupKey(password, fromBase64(data.salt));
 }

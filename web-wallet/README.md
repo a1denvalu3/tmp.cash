@@ -138,7 +138,7 @@ over HTTPS and use an HTTPS mint; browsers block mixed-content requests.
   unencrypted files. Existing encrypted backups remain compatible. Restore
   requires an empty wallet in a new browser profile. A snapshot cannot recover
   changes made after its last successful save, and no backups extend token
-  deadlines. Use one active copy of a restored wallet to avoid competing spends.
+  deadlines. Without device sync, use one active copy of a restored wallet to avoid competing spends.
 - **Debug logs:** in Settings, choose **Copy debug logs** and paste the report
   into your support chat, or choose **Download logs** to share a JSON file.
   A selectable report appears if clipboard access is unavailable. Logs also
@@ -381,3 +381,57 @@ in the user's browser.
 References: [Google token model](https://developers.google.com/identity/oauth2/web/guides/use-token-model),
 [Drive app data](https://developers.google.com/workspace/drive/api/guides/appdata),
 [CloudKit JS](https://developer.apple.com/documentation/cloudkitjs).
+
+## Device synchronization
+
+Google Drive backups now contain a Yjs document alongside the recoverable wallet state.
+After the user enables Google backups, the wallet merges unseen documents from the same
+wallet's backup files before saving. Restoring the current CRDT backup preserves its wallet identity,
+password-derived key/salt, and sync group, so two active installations can synchronize
+through the same Google account. Sign-in alone still does not enable uploads. Deliberately restoring an earlier copy or
+an older snapshot format creates a separate Drive backup lineage.
+An expired/revoked Google token requires reconnection; a Drive error does not silently
+switch providers. When Google is disconnected, configured device sync uses Nostr.
+iCloud remains a snapshot-backup provider rather than a synchronization provider.
+
+Without a Google session, Settings → **Sync your devices** offers encrypted Nostr sync,
+using `wss://buzz.cashu.space` by default. The relay requires NIP-42 authentication;
+the wallet signs challenges with a dedicated sync key and retries rejected reads/writes
+after authentication. Other `wss://` relays can be selected; insecure `ws://` is accepted
+only for localhost testing. Authentication does not override a relay's access policy.
+Create a private sync code on the original device and enter it in an empty wallet on
+another device. Anyone with this code can decrypt and spend the wallet. The code is not
+put in a URL, sent to the mint, or included in diagnostic reports.
+
+The wallet keeps its existing prepare/reserve/execute/finalize operation manager.
+Financial state changes and immutable recovery fragments commit in the same IndexedDB
+transaction. Yjs merges these fragments; mint-confirmed completions determine which
+competing attempts succeeded. Remote CRDT updates never automatically execute a new
+payment. Unresolved operations remain available through Pending operations → Retry,
+including exact-request recovery on another device. Outgoing tokens remain excluded
+while unclaimed, and old checkpoints cannot restore confirmed spent inputs.
+
+When synchronization is enabled, the complete prepared operation must reach the active
+storage provider before a spending POST. A provider failure retains the local request
+and reservations for an explicit retry. Pausing Nostr sync allows operations without
+remote confirmation; it does not revoke other devices or erase existing copies.
+Each independent installation gets a fresh checkpoint-writer identity. Token output
+secrets remain random; no shared derivation counter is introduced.
+
+Nostr checkpoints use NIP-44 encrypted chunks (kind 78) plus an addressable manifest
+(kind 30078), signed with the sync key. One relay must acknowledge every chunk before
+its manifest. Lost acknowledgments retry the persisted packet, and incomplete or
+invalid checkpoints never replace local wallet state. Relay acceptance is subject to
+the relay's retention policy; it is not an independent durability guarantee.
+
+Drive retains the current and previous CRDT backup per writer, deleting older copies
+only after a successor upload succeeds. Older legacy snapshots stay available for
+explicit restore. The CRDT retains recovery facts and spent/completion markers;
+encoding a checkpoint does not discard logical history. Checkpoints/backups have
+explicit size limits and stop further synchronized operations rather than silently
+truncate data. Garbage collection of those markers and relay-side deletion are not
+implemented. Keep an independent backup.
+
+Synchronization is eventual: devices may briefly show different balances and a
+competing operation can be rejected by the mint. This does not provide Firestore-style
+linearizable reads. Backing settlement and token deadlines still apply.

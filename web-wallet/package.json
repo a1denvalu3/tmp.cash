@@ -26,10 +26,12 @@
     "coco-cashu-core": "file:packages/coco",
     "coco-cashu-indexeddb": "file:packages/coco-indexeddb",
     "lucide-react": "0.468.0",
+    "nostr-tools": "2.26.0",
     "qr-scanner": "1.4.2",
     "qrcode": "1.5.4",
     "react": "19.1.1",
-    "react-dom": "19.1.1"
+    "react-dom": "19.1.1",
+    "yjs": "13.6.33"
   },
   "devDependencies": {
     "@playwright/test": "1.56.1",
@@ -37,11 +39,13 @@
     "@types/qrcode": "1.5.5",
     "@types/react": "19.1.13",
     "@types/react-dom": "19.1.9",
+    "@types/ws": "8.18.2",
     "@vitejs/plugin-react": "4.7.0",
     "fake-indexeddb": "6.2.4",
     "prettier": "3.6.2",
     "typescript": "5.9.2",
     "vite": "6.4.1",
-    "vitest": "3.2.4"
+    "vitest": "3.2.4",
+    "ws": "8.22.2"
   }
 }

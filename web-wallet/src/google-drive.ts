@@ -169,6 +169,7 @@ function metadata(file: DriveFile): CloudBackup {
     walletId: file.appProperties.walletId,
     updated: Number(file.appProperties.created),
     encrypted: file.appProperties.encrypted === "true",
+    ...(file.appProperties.writer ? { writer: file.appProperties.writer } : {}),
   };
 }
 export class GoogleDrive implements CloudClient {
@@ -234,6 +235,10 @@ export class GoogleDrive implements CloudClient {
       pageToken =
         typeof data.nextPageToken === "string" ? data.nextPageToken : "";
     } while (pageToken && files.length < 1000);
+    if (pageToken)
+      throw new CloudError(
+        "Too many backup files to synchronize safely. No recovery records were discarded.",
+      );
     return files;
   }
   async list() {
@@ -252,6 +257,7 @@ export class GoogleDrive implements CloudClient {
     created: number,
     payload: string,
     name: string,
+    writer?: string,
   ) {
     if (!/^[\w-]+$/.test(walletId) || !/^[\w-]+$/.test(uploadId))
       throw new CloudError("This backup could not be saved.");
@@ -269,6 +275,7 @@ export class GoogleDrive implements CloudClient {
       uploadId,
       created: String(created),
       encrypted: String(isEncryptedBackup(payload)),
+      ...(writer ? { writer } : {}),
     };
     const boundary = "tmpcash_" + crypto.randomUUID();
     const body = new Blob([

@@ -61,6 +61,13 @@ import { TmpCashMark } from "./TmpCashMark";
 import { expiredBackings } from "./backings";
 import { InvoiceScanner } from "./InvoiceScanner";
 import { CopyButton } from "./CopyButton";
+import {
+  assertWalletSyncGroup,
+  createWalletSyncBackup,
+  mergeWalletSyncBackup,
+} from "./sync-document";
+import { readSyncSettings } from "./nostr-sync";
+import { useWalletSync } from "./WalletSync";
 import { ActivityDetails } from "./ActivityDetails";
 import {
   purposeNames,
@@ -286,6 +293,21 @@ export function App() {
       setReconnect((n) => n + 1);
     },
     dialog !== null,
+    (fn) => (manager ? manager.synchronize(fn) : fn()),
+  );
+  const selectSyncMint = useCallback((mint: string) => {
+    localStorage.setItem("layer3-mint", mint);
+    setMintUrl(mint);
+    setMintInput(mint);
+    setReconnect((n) => n + 1);
+  }, []);
+  const nostrSync = useWalletSync(
+    repo,
+    manager,
+    mintUrl,
+    selectSyncMint,
+    cloudBackups.client,
+    cloudBackups.saveNow,
   );
   const busyRef = useRef(false);
   const meltQuoteVersion = useRef(0);
@@ -1245,6 +1267,7 @@ export function App() {
                   )}
               </section>
               {cloudBackups.settings}
+              {nostrSync}
               <section className="settings-card">
                 <h2>Keep a copy.</h2>
                 <p className="muted">
@@ -1883,8 +1906,21 @@ export function App() {
                       );
                     const state = await repo.read();
                     const text = encryptFile
-                        ? await encryptBackup(state, mintUrl, password)
-                        : plaintextBackup(state, mintUrl),
+                        ? await encryptBackup(
+                            state,
+                            mintUrl,
+                            password,
+                            (await readSyncSettings(repo))
+                              ? await createWalletSyncBackup(repo, mintUrl)
+                              : undefined,
+                          )
+                        : plaintextBackup(
+                            state,
+                            mintUrl,
+                            (await readSyncSettings(repo))
+                              ? await createWalletSyncBackup(repo, mintUrl)
+                              : undefined,
+                          ),
                       url = URL.createObjectURL(
                         new Blob([text], { type: "application/json" }),
                       );
@@ -1908,7 +1944,10 @@ export function App() {
                       await backupFile.text(),
                       password,
                     );
+                    await assertWalletSyncGroup(repo, restored.sync);
                     await repo.importState(restored.state);
+                    if (restored.sync)
+                      await mergeWalletSyncBackup(repo, restored.sync);
                     localStorage.setItem("layer3-mint", restored.mint);
                     setMintUrl(restored.mint);
                     setMintInput(restored.mint);

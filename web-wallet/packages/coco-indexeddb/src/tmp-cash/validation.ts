@@ -145,7 +145,18 @@ export function validateTmpCashState(input: unknown): TmpCashState {
     if (payload.kind !== "mint")
       for (const proof of payload.token.proofs) {
         const saved = proofById.get(psNullifier(proof));
-        if (!saved || saved.operationId !== op.id || saved.state !== "reserved")
+        const holder = saved?.operationId
+          ? operationById.get(saved.operationId)
+          : undefined;
+        const shared =
+          holder?.mint === op.mint &&
+          holder.payload.kind !== "mint" &&
+          holder.payload.token.proofs.some((p) => psNullifier(p) === saved?.id);
+        if (
+          !saved ||
+          (saved.operationId !== op.id && !shared) ||
+          saved.state !== "reserved"
+        )
           throw new Error("Backup operation reservations are inconsistent");
       }
   }
