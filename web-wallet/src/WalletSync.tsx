@@ -7,6 +7,7 @@ import { readCloudSettings } from "./cloud";
 import { CopyButton } from "./CopyButton";
 import {
   NostrWalletSync,
+  clearEmptySyncSetup,
   createSyncSettings,
   exportSyncCode,
   importSyncCode,
@@ -197,6 +198,20 @@ export function useWalletSync(
       setRestart((n) => n + 1);
     }
   }
+  async function backToSetup() {
+    if (!manager) throw new Error("Connect to your mint first.");
+    await manager.synchronize(async () => {
+      await clearEmptySyncSetup(repo);
+      service.current?.stop();
+      service.current = null;
+      manager.setSyncBarrier(null);
+      setConfig(null);
+      setPaused(false);
+      setShowCode(false);
+      setCode("");
+      setRestart((n) => n + 1);
+    });
+  }
   const panel = (
     <section className="settings-card" aria-labelledby="nostr-sync-title">
       <h2 id="nostr-sync-title">Sync your devices</h2>
@@ -348,6 +363,18 @@ export function useWalletSync(
             relay confirmation. It does not revoke another device or delete
             relay copies. Keep a separate backup; sync does not extend token
             deadlines.
+          </p>
+          <button
+            className="button secondary"
+            disabled={busy || !manager}
+            onClick={() => void action(backToSetup)}
+          >
+            Back to sync setup
+          </button>
+          <p className="small muted">
+            An empty wallet can return to setup to enter another device’s
+            private sync code. Wallets with funds, history, or recovery records
+            keep their current setup.
           </p>
         </>
       )}

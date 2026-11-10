@@ -400,7 +400,11 @@ the wallet signs challenges with a dedicated sync key and retries rejected reads
 after authentication. Other `wss://` relays can be selected; insecure `ws://` is accepted
 only for localhost testing. Authentication does not override a relay's access policy.
 Create a private sync code on the original device and enter it in an empty wallet on
-another device. Anyone with this code can decrypt and spend the wallet. The code is not
+another device under **Connect to an existing wallet**. If you accidentally enabled
+sync on the empty receiving wallet first, choose **Back to sync setup**, then enter
+the original wallet's code. Returning to setup clears only unused sync configuration;
+wallets with funds, history, or recovery records keep their current membership.
+Anyone with this code can decrypt and spend the wallet. The code is not
 put in a URL, sent to the mint, or included in diagnostic reports.
 
 The wallet keeps its existing prepare/reserve/execute/finalize operation manager.

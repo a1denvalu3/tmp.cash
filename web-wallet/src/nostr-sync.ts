@@ -159,6 +159,50 @@ export async function saveSyncSettings(
   await repo.syncData.put({ id: "settings", value: settings(s) });
 }
 
+async function syncLock<T>(fn: () => Promise<T>): Promise<T> {
+  return typeof navigator !== "undefined" && navigator.locks
+    ? navigator.locks.request("tmp-cash-nostr-sync", fn)
+    : fn();
+}
+
+/** Caller holds the wallet lock. Only an unused setup may be forgotten. */
+export async function clearEmptySyncSetup(
+  repo: TmpCashIndexedDbRepository,
+): Promise<void> {
+  await syncLock(() =>
+    repo.runTransaction(
+      "rw",
+      ["proofs", "operations", "fundings", "activity"],
+      async () => {
+        const hasRecords = (state: WalletSyncFact["state"]) =>
+          Object.values(state).some((rows) => rows.length > 0);
+        const hasRecovery = (fact: WalletSyncFact) =>
+          hasRecords(fact.state) || !!fact.terminal || !!fact.consumed;
+        let used = hasRecords(await repo.read());
+        for (const fact of await repo.readSyncFacts())
+          used ||= hasRecovery(validateSyncFact(fact));
+        const saved = await repo.syncData.get("document");
+        if (saved) {
+          const doc = new Y.Doc();
+          try {
+            Y.applyUpdate(doc, saved.value as Uint8Array);
+            for (const raw of doc.getMap<string>("facts").values())
+              used ||= hasRecovery(validateSyncFact(JSON.parse(raw)));
+          } finally {
+            doc.destroy();
+          }
+        }
+        if (used)
+          throw new Error(
+            "This wallet has funds, history, or recovery records. Use a new browser profile to connect to a different wallet.",
+          );
+        await repo.syncFacts.clear();
+        await repo.syncData.clear();
+      },
+    ),
+  );
+}
+
 /** A complete packet must be accepted on the same relay before its manifest is published. */
 export class NostrRelayIO implements RelayIO {
   private connections = new Map<string, Relay>();
@@ -326,12 +370,20 @@ export class NostrWalletSync {
     this.key = getConversationKey(hexToBytes(config.secret), this.pubkey);
   }
   private exclusive<T>(fn: () => Promise<T>): Promise<T> {
-    const run = async (): Promise<T> => {
-      if (this.stopped) throw new Error("Wallet sync is stopped.");
-      return typeof navigator !== "undefined" && navigator.locks
-        ? await navigator.locks.request("tmp-cash-nostr-sync", fn)
-        : fn();
-    };
+    const run = () =>
+      syncLock(async () => {
+        if (this.stopped) throw new Error("Wallet sync is stopped.");
+        const current = await readSyncSettings(this.repo);
+        if (
+          !current ||
+          current.secret !== this.config.secret ||
+          current.device !== this.config.device
+        )
+          throw new Error(
+            "Wallet sync settings changed. Reload this device before syncing.",
+          );
+        return fn();
+      });
     const task = this.queue.then(run, run);
     this.queue = task.catch(() => undefined);
     return task;
