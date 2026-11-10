@@ -1,5 +1,6 @@
 import { test, expect, type BrowserContext, type Page } from "@playwright/test";
 import { psInvoiceDetails } from "@cashu/cashu-ts/tmp-cash";
+import { observeWalletUi, walletUiHistory } from "../helpers/wallet-ui-history";
 import { encryptBackup, decryptBackup } from "../../src/backup";
 
 test.skip(
@@ -758,3 +759,54 @@ test("synchronizes active devices through the Drive backup document without cont
     await fresh.close();
   }
 });
+
+for (const balance of [0, 16]) {
+  test(`keeps the ${balance}-sat balance and mint status stable during background Drive synchronization`, async ({
+    page,
+    context,
+  }) => {
+    const state = providerState();
+    await providers(context, state);
+    await welcome(page);
+    await signIn(page);
+    await chooseProtection(page, true, "Stable wallet");
+    await finish(page);
+    if (balance) await fund(page, balance);
+    await expect(page.getByTestId("balance")).toHaveText(`${balance}sats`);
+    await expect(page.getByTestId("mint-status")).toHaveText("Mint connected");
+    await page.route(mintUrl + "/v1/htlcs/check", async (route) => {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      await route.continue();
+    });
+    let lists = 0;
+    page.on("request", (request) => {
+      const url = new URL(request.url());
+      if (
+        url.hostname === "www.googleapis.com" &&
+        url.pathname === "/drive/v3/files" &&
+        request.method() === "GET"
+      )
+        lists++;
+    });
+    await observeWalletUi(page);
+    await expect
+      .poll(() => lists, { timeout: 20000 })
+      .toBeGreaterThanOrEqual(3);
+    if (balance) {
+      await page.route("https://www.googleapis.com/drive/v3/files?*", (route) =>
+        route.fulfill({ status: 503, json: { error: "Drive unavailable" } }),
+      );
+      await expect(
+        page.getByRole("button", { name: "Set up wallet backup", exact: true }),
+      ).toBeVisible({ timeout: 12000 });
+      await expect(page.getByTestId("balance")).toHaveText(`${balance}sats`);
+      await expect(page.getByTestId("mint-status")).toHaveText(
+        "Mint connected",
+      );
+    }
+    expect(await walletUiHistory(page)).toEqual({
+      balances: [`${balance}sats`],
+      mint: ["Mint connected"],
+    });
+  });
+}

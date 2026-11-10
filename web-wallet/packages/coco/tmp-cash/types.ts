@@ -116,4 +116,6 @@ export interface TmpCashView extends TmpCashState {
   expired: number;
   snapshot: PSSnapshot | null;
   verified: boolean;
+  /** Result of the last mint check, independent of in-progress synchronization. */
+  mintConnected: boolean;
 }

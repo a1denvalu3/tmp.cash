@@ -17,6 +17,7 @@ export async function testRelay(authRequired = true) {
     rejectAuth: false,
     dropNextAck: false,
     refused: 0,
+    reads: 0,
   };
   server.on("connection", (socket) => {
     const challenge = crypto.randomUUID();
@@ -77,6 +78,7 @@ export async function testRelay(authRequired = true) {
         send(["OK", event.id, true, ""]);
       }
       if (message[0] === "REQ") {
+        state.reads++;
         const [, id, filter] = message;
         if (authRequired && !pubkey) {
           state.refused++;
