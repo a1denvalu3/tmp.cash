@@ -118,27 +118,10 @@ over HTTPS and use an HTTPS mint; browsers block mixed-content requests.
   encrypted backups. Historical tokens may already be spent or expired; incoming
   tokens were exchanged for fresh proofs. Older entries remain readable and
   clearly indicate details that were not recorded.
-- **Wallet backup:** the wallet offers a guided sign-in and backup pop-up.
-  Sign in with Google or Apple, then choose your backup protection. The wallet checks for changes every five seconds while
-  open and saves proofs, backing preimages, pending request secrets, and outgoing
-  token history directly to your Google Drive or private iCloud storage. It retries failed saves, shows
-  the last successful save, and resumes after reload. Uploads are saved locally
-  before sending, so a lost response can be retried after reload without
-  blocking newer backups or replacing a newer server copy. Signing in alone does not
-  upload funds or overwrite a saved wallet. Sign in with the same provider and
-  account on a new browser to find and restore saved wallets.
-- **Backup protection:** passphrase encryption is recommended. Keep the
-  passphrase for recovery on a new device; social sign-in cannot reset it. The
-  browser saves a non-extractable encryption key locally for automatic backups,
-  not the passphrase. Alternatively, explicitly choose **No encryption** and
-  acknowledge that anyone who can access the backup—including the cloud
-  storage provider or someone who gets into the account—can read wallet secrets and
-  spend funds. This option permits recovery with social sign-in alone.
-- **Backup files:** exports and restores encrypted or explicitly acknowledged
-  unencrypted files. Existing encrypted backups remain compatible. Restore
-  requires an empty wallet in a new browser profile. A snapshot cannot recover
-  changes made after its last successful save, and no backups extend token
-  deadlines. Use one active copy of a restored wallet to avoid competing spends.
+- **Settings:** exports/restores password-encrypted backups containing proofs,
+  backing preimages, pending request secrets, and the outgoing token history.
+  Restore requires an empty wallet in a new browser profile. A snapshot backup
+  cannot recover operations created after it was downloaded.
 - **Debug logs:** in Settings, choose **Copy debug logs** and paste the report
   into your support chat, or choose **Download logs** to share a JSON file.
   A selectable report appears if clipboard access is unavailable. Logs also
@@ -218,7 +201,6 @@ npm test
 npx playwright install chromium
 npm run test:e2e
 npm run test:e2e:production
-npm run test:e2e:cloud:production
 ```
 
 Build produces a static `dist/` with separate `index.html`,
@@ -238,135 +220,3 @@ fake sats and do not touch `~/cashu-regtest` or an existing mint database.
 The modified libraries are source workspaces under `packages/`; no globally
 installed packages or sibling checkouts are required. See
 [PROVENANCE.md](PROVENANCE.md) for exact upstream revisions and changes.
-
-## Cloud backup setup
-
-Account sign-in and backup storage run entirely in the browser. The mint has no
-account endpoints, cookies, OAuth configuration, identity database, or backup
-storage. Google backups go directly to the user's Drive app-data folder; Apple
-backups go directly to that user's private iCloud CloudKit database. Account
-identifiers, cloud access tokens, and backup payloads are never sent to the mint.
-The mint receives only the existing ecash protocol requests.
-
-On first opening the wallet, a short pop-up explains recovery and invites the
-user to sign in. **Not now** dismisses it without blocking the wallet. The header
-keeps a **Back up wallet** button for returning to setup. After sign-in, the
-wallet offers an existing saved wallet to restore, or guides the user through
-adding a backup password or explicitly choosing account-only recovery. Setup is
-complete only after the first upload succeeds. Settings contains backup status
-and management rather than the initial setup form.
-
-### Google
-
-1. In Google Cloud Console, use an OAuth client of type **Web application**.
-   Configure Branding and Audience; add your test users while the app is in
-   Testing. Enable the **Google Drive API** in that same project.
-2. Add the wallet origin under **Authorized JavaScript origins**:
-   `http://127.0.0.1:5173` locally, or `https://tmp.cash` in production. This uses
-   Google's token popup flow, so `/api/cloud/callback/google` is no longer used.
-   Only `openid`, `email`, and `https://www.googleapis.com/auth/drive.appdata`
-   are requested. The app-data scope does not grant access to other Drive files.
-3. Put the public client ID in `web-wallet/.env.local`:
-
-   ```dotenv
-   VITE_GOOGLE_CLIENT_ID=your-client-id.apps.googleusercontent.com
-   VITE_DEFAULT_MINT=http://127.0.0.1:3338
-   ```
-
-   There is no OAuth client secret in the frontend or mint. Do not copy a client
-   secret or service-account key into any `VITE_` variable.
-
-4. Restart Vite after changing frontend environment values. Production builds
-   need rebuilding to pick up the public client ID. If the host sets a
-   Cross-Origin-Opener-Policy, use `same-origin-allow-popups` so Google's sign-in
-   popup can complete. Keep the generated Content Security Policy, which allows
-   the official Google and Apple SDKs and authentication frames.
-
-Google access tokens stay in this browser tab's session storage and expire.
-A reload in the same session can resume automatic saves. After token expiry or
-opening a new browser session, the wallet offers **Reconnect Google**. Google
-requires a user interaction to issue a new token; the wallet does not claim to
-save unattended while signed out. Tokens and identity details are excluded from
-mint requests and wallet diagnostics.
-
-### Apple
-
-Configure an iCloud container in Apple CloudKit Console and create a **web API
-token** restricted to the wallet's allowed origins. Set these public frontend
-values; do not use a server-to-server key:
-
-```dotenv
-VITE_APPLE_CLOUDKIT_CONTAINER=iCloud.your.container
-VITE_APPLE_CLOUDKIT_API_TOKEN=your-web-api-token
-VITE_APPLE_CLOUDKIT_ENVIRONMENT=development
-```
-
-CloudKit JS supplies Apple's sign-in button and manages its account session.
-All reads and writes use `privateCloudDatabase`. Set up these record types in
-CloudKit development, then deploy the schema before using `production`:
-
-- `TmpCashBackup`: `walletId` and `name` (String), `created`, `encrypted`, and
-  `chunks` (Int64). Enable querying this record type.
-- `TmpCashBackupChunk`: `data` (String).
-
-Backup contents are split into small chunk records; the manifest is written
-last. Partial uploads never appear in the restore picker. The Google and Apple
-choices appear only when the respective frontend configuration exists. Google
-and Apple keep separate recovery copies even when their accounts share an email.
-
-### Protection and recovery
-
-Password protection is recommended. The browser saves a non-extractable key in
-IndexedDB so automatic encryption continues without retyping the password.
-Recovery on a new device still requires the password; the cloud account cannot
-reset it. Account-only recovery requires an explicit warning and checkbox:
-anyone able to read the backup, including the storage provider or someone who
-gets into the cloud account, can read wallet secrets and spend funds. Empty
-passwords never silently select account-only recovery.
-
-Changes are checked every five seconds while the wallet is open. Each upload
-creates an immutable recovery copy in the user's cloud storage. Upload IDs and
-the pending payload are persisted before sending, so retrying a lost response
-can find an already accepted snapshot. Delayed uploads cannot overwrite newer
-copies. Recovery lists the latest copy for each saved wallet. Copies consume the
-user's cloud quota and remain until deleted; there is no automatic pruning.
-Google listings are bounded to the newest 1,000 files and Apple to 200 manifests.
-
-Restore requires an empty local wallet and validates the complete wallet state.
-Recovery rechecks the newest saved copy for the chosen wallet before downloading
-it. Users can also explicitly choose an earlier saved copy; that selection is
-preserved instead of silently substituting the newest one. Empty copies report
-an error, confirm successful password decryption when applicable, and expose the
-saved history. Known empty copies are marked and disabled in the picker. All
-discovered wallets remain available rather than truncating the picker to ten.
-Recovery never reports success or creates another restored wallet from an empty
-copy.
-It includes proofs, backing preimages, pending requests, funding recovery data,
-and activity. A successful restore enables continued automatic backups using the
-same protection choice. Use one active copy to avoid competing spends. Backups
-do not extend token deadlines and cannot recover changes made after the most
-recent successful save. Browser wallet data remains locally unencrypted.
-
-### Local testing
-
-Use Python 3.12 for the existing mint dependencies:
-
-```sh
-poetry env use python3.12
-poetry install
-poetry run tmp.cash-mint --backend fake --data data/local-google --fake-auto-accept
-```
-
-In another terminal, run `npm run dev` from `web-wallet` and open
-`http://127.0.0.1:5173/wallet/`. Only frontend configuration is needed for Google;
-there is no cloud route to proxy and no mint account configuration.
-
-The dedicated browser tests simulate only the provider SDKs and cloud APIs;
-the wallet UI, encryption, IndexedDB, mint protocol, and recovery run normally.
-They assert that no account or backup request goes to the mint. Real-provider
-acceptance needs the configured JavaScript origins, enabled APIs, and consent
-in the user's browser.
-
-References: [Google token model](https://developers.google.com/identity/oauth2/web/guides/use-token-model),
-[Drive app data](https://developers.google.com/workspace/drive/api/guides/appdata),
-[CloudKit JS](https://developer.apple.com/documentation/cloudkitjs).
