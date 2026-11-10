@@ -85,6 +85,9 @@ test("pairs isolated browsers through NIP-42, keeps outgoing tokens excluded, an
     await expect(other.getByTestId("balance")).toHaveText("8sats");
     expect(relay.auth.length).toBeGreaterThanOrEqual(3);
     expect(
+      [...relay.events.values()].every((event) => event.kind === 30078),
+    ).toBe(true);
+    expect(
       [...relay.events.values()].every(
         (e) => !e.content.includes("credential"),
       ),

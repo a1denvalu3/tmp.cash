@@ -418,11 +418,18 @@ remote confirmation; it does not revoke other devices or erase existing copies.
 Each independent installation gets a fresh checkpoint-writer identity. Token output
 secrets remain random; no shared derivation counter is introduced.
 
-Nostr checkpoints use NIP-44 encrypted chunks (kind 78) plus an addressable manifest
-(kind 30078), signed with the sync key. One relay must acknowledge every chunk before
-its manifest. Lost acknowledgments retry the persisted packet, and incomplete or
-invalid checkpoints never replace local wallet state. Relay acceptance is subject to
-the relay's retention policy; it is not an independent durability guarantee.
+Nostr checkpoints use NIP-44 encrypted chunks and manifests, all kind 30078 and signed
+with the sync key. Each chunk gets a unique `d` address so that later uploads do not
+replace data referenced by earlier checkpoints. Each device replaces only its own
+manifest; devices query manifests separately from chunks and merge every writer's
+checkpoint. One relay must acknowledge every chunk before its manifest.
+Lost acknowledgments retry the persisted packet. Older kind 78 checkpoints remain
+readable, and queued legacy uploads are converted locally before retrying. Update all
+devices: older wallet versions cannot read the new version 2 manifests.
+Incomplete or invalid checkpoints never replace local wallet state. When every relay
+fails, the wallet includes each relay's rejection reason in the sync error.
+Relay acceptance is subject to the relay's retention policy; it is not an independent
+durability guarantee.
 
 Drive retains the current and previous CRDT backup per writer, deleting older copies
 only after a successor upload succeeds. Older legacy snapshots stay available for
