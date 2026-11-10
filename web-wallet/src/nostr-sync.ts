@@ -20,6 +20,8 @@ import { normalizePSMintUrl } from "@cashu/cashu-ts/tmp-cash";
 
 export const DEFAULT_SYNC_RELAY = "wss://buzz.cashu.space";
 const SCOPE = "tmp.cash-sync-v1";
+const CHUNK_SCOPE = `${SCOPE}:chunk`;
+const CHECKPOINT_VERSION = 2;
 const MAX_DOCUMENT = 16_000_000;
 const CHUNK_SIZE = 24_000;
 const MAX_HEADS = 128;
@@ -162,6 +164,19 @@ export class NostrRelayIO implements RelayIO {
   private connections = new Map<string, Relay>();
   private closed = false;
   constructor(private config: NostrSyncSettings) {}
+  private failure(message: string, results: PromiseSettledResult<unknown>[]) {
+    const reasons = results.flatMap((result, index) => {
+      if (result.status === "fulfilled") return [];
+      const reason =
+        result.reason instanceof Error
+          ? result.reason.message
+          : typeof result.reason === "string"
+            ? result.reason
+            : "Relay request failed.";
+      return [`${this.config.relays[index]}: ${reason.slice(0, 240)}`];
+    });
+    return new Error(`${message} ${reasons.join("; ")}`);
+  }
   private async connect(url: string): Promise<Relay> {
     if (this.closed) throw new Error("Wallet sync is stopped.");
     let relay = this.connections.get(url);
@@ -229,8 +244,9 @@ export class NostrRelayIO implements RelayIO {
       (r): r is PromiseFulfilledResult<Event[]> => r.status === "fulfilled",
     );
     if (!completed.length)
-      throw new Error(
+      throw this.failure(
         "No relay could load wallet sync data. Reconnect and retry.",
+        results,
       );
     return [
       ...new Map(
@@ -264,8 +280,9 @@ export class NostrRelayIO implements RelayIO {
       }),
     );
     if (!results.some((r) => r.status === "fulfilled"))
-      throw new Error(
+      throw this.failure(
         "No relay accepted the complete wallet checkpoint. Your operation is saved locally; reconnect and retry.",
+        results,
       );
   }
   close() {
@@ -288,6 +305,11 @@ async function digest(bytes: Uint8Array): Promise<string> {
 interface PendingPacket {
   hash: string;
   events: Event[];
+}
+interface CheckpointManifest {
+  version: 1 | 2;
+  hash: string;
+  chunks: string[];
 }
 
 export class NostrWalletSync {
@@ -325,18 +347,86 @@ export class NostrWalletSync {
       hexToBytes(this.config.secret),
     );
   }
-  private plaintext(event: Event, kind: number): string {
+  private plaintext(event: Event, kind: number, scope = SCOPE): string {
     // Parse a fresh wire object so no library verification-cache flag can bypass signature checks.
     const wire: Event = JSON.parse(JSON.stringify(event));
     if (
       wire.pubkey !== this.pubkey ||
       wire.kind !== kind ||
       wire.content.length > 100_000 ||
-      !wire.tags.some((t) => t[0] === "t" && t[1] === SCOPE) ||
+      !wire.tags.some((t) => t[0] === "t" && t[1] === scope) ||
       !verifyEvent(wire)
     )
       throw new Error("Invalid signed wallet sync event.");
     return decrypt(wire.content, this.key);
+  }
+  private manifest(head: Event): CheckpointManifest {
+    if (!head.tags.some((t) => t[0] === "d" && t[1]?.startsWith(SCOPE + ":")))
+      throw new Error("Invalid wallet checkpoint address.");
+    const manifest = JSON.parse(this.plaintext(head, 30078));
+    if (
+      (manifest.version !== 1 && manifest.version !== CHECKPOINT_VERSION) ||
+      !/^[0-9a-f]{64}$/.test(manifest.hash) ||
+      !Array.isArray(manifest.chunks) ||
+      !manifest.chunks.length ||
+      manifest.chunks.length > MAX_CHUNKS ||
+      manifest.chunks.some(
+        (id: unknown) => typeof id !== "string" || !/^[0-9a-f]{64}$/.test(id),
+      )
+    )
+      throw new Error("Invalid wallet checkpoint manifest.");
+    return manifest;
+  }
+  private chunk(content: string): Event {
+    // Never reuse an address: replacing a chunk would invalidate older manifests' event IDs.
+    return this.event(
+      30078,
+      [
+        ["d", `${CHUNK_SCOPE}:${crypto.randomUUID()}`],
+        ["t", CHUNK_SCOPE],
+      ],
+      content,
+    );
+  }
+  private async nextStamp(previous = 0): Promise<number> {
+    const saved = Number((await this.repo.syncData.get("stamp"))?.value ?? 0);
+    return Math.max(Math.floor(Date.now() / 1000), saved + 1, previous + 1);
+  }
+  private async savePending(pending: PendingPacket): Promise<void> {
+    await this.repo.syncData.bulkPut([
+      { id: "stamp", value: pending.events.at(-1)!.created_at },
+      { id: "pending", value: pending },
+    ]);
+  }
+  private async upgradePending(pending: PendingPacket): Promise<PendingPacket> {
+    const head = pending.events.at(-1)!;
+    const manifest = this.manifest(head);
+    if (manifest.version === CHECKPOINT_VERSION) return pending;
+    const byId = new Map(pending.events.map((event) => [event.id, event]));
+    const chunks = manifest.chunks.map((id) => {
+      const event = byId.get(id);
+      if (!event) throw new Error("Pending wallet checkpoint is incomplete.");
+      return this.chunk(this.plaintext(event, 78));
+    });
+    const upgraded = {
+      hash: pending.hash,
+      events: [
+        ...chunks,
+        this.event(
+          30078,
+          head.tags,
+          JSON.stringify({
+            version: CHECKPOINT_VERSION,
+            hash: manifest.hash,
+            chunks: chunks.map((chunk) => chunk.id),
+          }),
+          await this.nextStamp(head.created_at),
+        ),
+      ],
+    };
+    // Persist the converted packet before any upload; a reload retries these exact signed events.
+    await this.savePending(upgraded);
+    return upgraded;
   }
   private async document(): Promise<Y.Doc> {
     const doc = new Y.Doc();
@@ -373,27 +463,28 @@ export class NostrWalletSync {
         | PendingPacket
         | undefined;
       if (pending) {
+        pending = await this.upgradePending(pending);
         await this.io.publishPacket(pending.events);
-        await this.repo.syncData.put({ id: "published", value: pending.hash });
+        await this.repo.syncData.put({
+          id: "published",
+          value: `${CHECKPOINT_VERSION}:${pending.hash}`,
+        });
         await this.repo.syncData.delete("pending");
       }
-      if ((await this.repo.syncData.get("published"))?.value === hash) {
+      // Including the wire version republishes legacy checkpoints even when the document is unchanged.
+      if (
+        (await this.repo.syncData.get("published"))?.value ===
+        `${CHECKPOINT_VERSION}:${hash}`
+      ) {
         await this.saveDocument(doc);
         return;
       }
       const chunks: Event[] = [];
       for (let start = 0; start < data.length; start += CHUNK_SIZE)
         chunks.push(
-          this.event(
-            78,
-            [["t", SCOPE]],
-            encode64(data.slice(start, start + CHUNK_SIZE)),
-          ),
+          this.chunk(encode64(data.slice(start, start + CHUNK_SIZE))),
         );
-      const lastStamp = Number(
-        (await this.repo.syncData.get("stamp"))?.value ?? 0,
-      );
-      const stamp = Math.max(Math.floor(Date.now() / 1000), lastStamp + 1);
+      const stamp = await this.nextStamp();
       // Addressable-event replacement is by timestamp, including rapid consecutive wallet operations.
       const head = this.event(
         30078,
@@ -401,15 +492,21 @@ export class NostrWalletSync {
           ["d", `${SCOPE}:${this.config.device}`],
           ["t", SCOPE],
         ],
-        JSON.stringify({ version: 1, hash, chunks: chunks.map((c) => c.id) }),
+        JSON.stringify({
+          version: CHECKPOINT_VERSION,
+          hash,
+          chunks: chunks.map((c) => c.id),
+        }),
         stamp,
       );
       pending = { hash, events: [...chunks, head] };
       await this.saveDocument(doc);
-      await this.repo.syncData.put({ id: "stamp", value: stamp });
-      await this.repo.syncData.put({ id: "pending", value: pending });
+      await this.savePending(pending);
       await this.io.publishPacket(pending.events);
-      await this.repo.syncData.put({ id: "published", value: hash });
+      await this.repo.syncData.put({
+        id: "published",
+        value: `${CHECKPOINT_VERSION}:${hash}`,
+      });
       await this.repo.syncData.delete("pending");
     } finally {
       doc.destroy();
@@ -437,31 +534,15 @@ export class NostrWalletSync {
       const doc = await this.document();
       try {
         for (const head of heads) {
-          if (
-            !head.tags.some(
-              (t) => t[0] === "d" && t[1]?.startsWith(SCOPE + ":"),
-            )
-          )
-            throw new Error("Invalid wallet checkpoint address.");
-          const manifest = JSON.parse(this.plaintext(head, 30078));
-          if (
-            manifest.version !== 1 ||
-            !/^[0-9a-f]{64}$/.test(manifest.hash) ||
-            !Array.isArray(manifest.chunks) ||
-            !manifest.chunks.length ||
-            manifest.chunks.length > MAX_CHUNKS ||
-            manifest.chunks.some(
-              (id: unknown) =>
-                typeof id !== "string" || !/^[0-9a-f]{64}$/.test(id),
-            )
-          )
-            throw new Error("Invalid wallet checkpoint manifest.");
+          const manifest = this.manifest(head);
+          const chunkKind = manifest.version === 1 ? 78 : 30078;
+          const chunkScope = manifest.version === 1 ? SCOPE : CHUNK_SCOPE;
           const events: Event[] = [];
           for (let i = 0; i < manifest.chunks.length; i += 64)
             events.push(
               ...(await this.io.query({
                 ids: manifest.chunks.slice(i, i + 64),
-                kinds: [78],
+                kinds: [chunkKind],
                 authors: [this.pubkey],
               })),
             );
@@ -472,7 +553,9 @@ export class NostrWalletSync {
               throw new Error(
                 "A wallet checkpoint is incomplete. Recovery data was retained; retry synchronization.",
               );
-            const piece = decode64(this.plaintext(event, 78));
+            const piece = decode64(
+              this.plaintext(event, chunkKind, chunkScope),
+            );
             if (piece.length > CHUNK_SIZE)
               throw new Error("Wallet sync chunk is too large.");
             return piece;

@@ -14,6 +14,8 @@ export async function testRelay(authRequired = true) {
   const auth: Event[] = [];
   const state = {
     rejectWrites: false,
+    // Match the default relay's policy: addressable app data is accepted, kind 78 is not.
+    rejectKinds: [78],
     rejectAuth: false,
     dropNextAck: false,
     refused: 0,
@@ -48,6 +50,10 @@ export async function testRelay(authRequired = true) {
         }
         if (state.rejectWrites || !verifyEvent(event)) {
           send(["OK", event.id, false, "restricted: write refused"]);
+          return;
+        }
+        if (state.rejectKinds.includes(event.kind)) {
+          send(["OK", event.id, false, "restricted: unknown event kind"]);
           return;
         }
         if (event.kind === 30078) {

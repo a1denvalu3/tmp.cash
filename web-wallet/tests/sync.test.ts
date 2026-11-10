@@ -2,12 +2,16 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import "fake-indexeddb/auto";
 import WebSocket from "ws";
 import Dexie from "dexie";
+import * as Y from "yjs";
 import { useWebSocketImplementation } from "nostr-tools/relay";
 import { matchFilter, type Filter } from "nostr-tools/filter";
-import type { Event } from "nostr-tools/pure";
+import { finalizeEvent, getPublicKey, type Event } from "nostr-tools/pure";
+import { decrypt, encrypt, getConversationKey } from "nostr-tools/nip44";
+import { bytesToHex, hexToBytes } from "nostr-tools/utils";
 import {
   TmpCashIndexedDbRepository,
   emptyWalletState,
+  canonical,
 } from "coco-cashu-indexeddb/tmp-cash";
 import { psRandomHex, psPreimageHash } from "@cashu/cashu-ts/tmp-cash";
 import {
@@ -16,6 +20,7 @@ import {
   importSyncCode,
   NostrWalletSync,
   saveSyncSettings,
+  type NostrSyncSettings,
   type RelayIO,
 } from "../src/nostr-sync";
 import {
@@ -36,6 +41,13 @@ import { testRelay } from "./helpers/nostr-relay";
 
 useWebSocketImplementation(WebSocket);
 const mint = "http://127.0.0.1:3339";
+const scope = "tmp.cash-sync-v1";
+const isHead = (event: Event) =>
+  event.kind === 30078 &&
+  event.tags.some((tag) => tag[0] === "t" && tag[1] === scope);
+const isChunk = (event: Event) =>
+  event.kind === 30078 &&
+  event.tags.some((tag) => tag[0] === "t" && tag[1] === `${scope}:chunk`);
 const repos: TmpCashIndexedDbRepository[] = [];
 const workers: NostrWalletSync[] = [];
 afterEach(async () => {
@@ -64,6 +76,53 @@ async function funding(repo: TmpCashIndexedDbRepository) {
   };
   await repo.saveFunding(value);
   return value;
+}
+async function legacyCheckpoint(
+  repo: TmpCashIndexedDbRepository,
+  config: NostrSyncSettings,
+) {
+  const doc = new Y.Doc();
+  for (const fact of await repo.readSyncFacts())
+    doc.getMap<string>("facts").set(fact.id, canonical(fact));
+  const data = Y.encodeStateAsUpdate(doc);
+  doc.destroy();
+  const hash = bytesToHex(
+    new Uint8Array(await crypto.subtle.digest("SHA-256", new Uint8Array(data))),
+  );
+  const secret = hexToBytes(config.secret);
+  const key = getConversationKey(secret, getPublicKey(secret));
+  const sign = (kind: number, tags: string[][], content: string) =>
+    finalizeEvent(
+      {
+        kind,
+        tags,
+        content: encrypt(content, key),
+        created_at: Math.floor(Date.now() / 1000),
+      },
+      secret,
+    );
+  const chunks: Event[] = [];
+  for (let offset = 0; offset < data.length; offset += 24000)
+    chunks.push(
+      sign(
+        78,
+        [["t", scope]],
+        Buffer.from(data.slice(offset, offset + 24000)).toString("base64"),
+      ),
+    );
+  const head = sign(
+    30078,
+    [
+      ["d", `${scope}:${config.device}`],
+      ["t", scope],
+    ],
+    JSON.stringify({
+      version: 1,
+      hash,
+      chunks: chunks.map((chunk) => chunk.id),
+    }),
+  );
+  return { data, packet: { hash, events: [...chunks, head] } };
 }
 class MemoryRelay implements RelayIO {
   events = new Map<string, Event>();
@@ -122,6 +181,7 @@ describe("Yjs checkpoints over signed, encrypted relay events", () => {
       [x.id, y.id].sort(),
     );
     expect(await a.read()).toEqual(await b.read());
+    expect([...io.events.values()].filter(isHead)).toHaveLength(2);
     const wire = JSON.stringify([...io.events.values()]);
     expect(wire).not.toContain(x.preimage);
     expect(wire).not.toContain(y.preimage);
@@ -150,7 +210,7 @@ describe("Yjs checkpoints over signed, encrypted relay events", () => {
     const { a, b, left, right } = await pair(io);
     await funding(a);
     await left.flush();
-    const chunk = [...io.events.values()].find((e) => e.kind === 78)!;
+    const chunk = [...io.events.values()].find(isChunk)!;
     io.events.delete(chunk.id);
     const previous = await b.read();
     await expect(right.synchronize()).rejects.toThrow("incomplete");
@@ -161,7 +221,7 @@ describe("Yjs checkpoints over signed, encrypted relay events", () => {
     const { a, b, left, right } = await pair(io);
     await funding(a);
     await left.flush();
-    const head = [...io.events.values()].find((e) => e.kind === 30078)!;
+    const head = [...io.events.values()].find(isHead)!;
     head.content = head.content.slice(0, -2) + "aa";
     await expect(right.synchronize()).rejects.toThrow("Invalid signed");
     expect((await b.read()).fundings).toEqual([]);
@@ -171,11 +231,106 @@ describe("Yjs checkpoints over signed, encrypted relay events", () => {
     const { a, b, left, right } = await pair(io);
     for (let i = 0; i < 85; i++) await funding(a);
     await left.flush();
+    const chunks = [...io.events.values()].filter(isChunk);
+    expect(chunks.length).toBeGreaterThan(1);
     expect(
-      [...io.events.values()].filter((e) => e.kind === 78).length,
-    ).toBeGreaterThan(1);
+      new Set(chunks.map((e) => e.tags.find((t) => t[0] === "d")![1])).size,
+    ).toBe(chunks.length);
+    await funding(a);
+    await left.flush();
+    expect(chunks.every((chunk) => io.events.has(chunk.id))).toBe(true);
+    expect([...io.events.values()].filter(isHead)).toHaveLength(1);
     await right.synchronize();
-    expect((await b.read()).fundings).toHaveLength(85);
+    expect((await b.read()).fundings).toHaveLength(86);
+    expect(await b.read()).toEqual(await a.read());
+  });
+  it("reads legacy checkpoints containing normal kind 78 chunks", async () => {
+    const io = new MemoryRelay();
+    const { a, b, left, right } = await pair(io);
+    await funding(a);
+    const { packet } = await legacyCheckpoint(a, left.config);
+    await io.publishPacket(packet.events);
+    await right.synchronize(true);
+    expect(await b.read()).toEqual(await a.read());
+  });
+  it("republishes an unchanged legacy document in the new checkpoint format", async () => {
+    const io = new MemoryRelay();
+    const { a, b, left, right } = await pair(io);
+    await funding(a);
+    const { data, packet } = await legacyCheckpoint(a, left.config);
+    await io.publishPacket(packet.events);
+    await a.syncData.bulkPut([
+      { id: "document", value: data },
+      { id: "published", value: packet.hash },
+      { id: "stamp", value: packet.events.at(-1)!.created_at },
+    ]);
+    await left.flush();
+    const head = [...io.events.values()].find(isHead)!;
+    expect(head.id).not.toBe(packet.events.at(-1)!.id);
+    expect(head.created_at).toBeGreaterThan(packet.events.at(-1)!.created_at);
+    // Only the new addressable chunks are needed to recover the unchanged wallet.
+    for (const event of packet.events) io.events.delete(event.id);
+    await right.synchronize(true);
+    expect(await b.read()).toEqual(await a.read());
+  });
+  it("converts a queued legacy packet durably, retries it after reload, and then uploads newer local facts", async () => {
+    const relay = await testRelay();
+    try {
+      const a = repository(),
+        b = repository();
+      const config = createSyncSettings([relay.url], mint);
+      const other = importSyncCode(exportSyncCode(config));
+      await saveSyncSettings(a, config);
+      await saveSyncSettings(b, other);
+      for (let i = 0; i < 85; i++) await funding(a);
+      const { data, packet } = await legacyCheckpoint(a, config);
+      expect(packet.events.filter((e) => e.kind === 78).length).toBeGreaterThan(
+        1,
+      );
+      await a.syncData.bulkPut([
+        { id: "document", value: data },
+        { id: "pending", value: packet },
+        { id: "stamp", value: packet.events.at(-1)!.created_at },
+      ]);
+      await funding(a);
+      relay.state.rejectWrites = true;
+      const left = new NostrWalletSync(a, config);
+      workers.push(left);
+      await expect(left.flush()).rejects.toThrow(
+        `${relay.url}: restricted: write refused`,
+      );
+      const converted = (await a.syncData.get("pending"))!
+        .value as typeof packet;
+      expect(converted.hash).toBe(packet.hash);
+      expect(converted.events.every((event) => event.kind === 30078)).toBe(
+        true,
+      );
+      expect(converted.events.at(-1)!.created_at).toBeGreaterThan(
+        packet.events.at(-1)!.created_at,
+      );
+      expect(relay.events.size).toBe(0);
+      left.stop();
+      relay.state.rejectWrites = false;
+      const reloaded = new NostrWalletSync(a, config);
+      const right = new NostrWalletSync(b, other);
+      workers.push(reloaded, right);
+      await reloaded.flush();
+      expect(
+        converted.events.filter(isChunk).every((e) => relay.events.has(e.id)),
+      ).toBe(true);
+      expect(await a.syncData.get("pending")).toBeUndefined();
+      await right.synchronize(true);
+      expect((await b.read()).fundings).toHaveLength(86);
+      expect(await b.read()).toEqual(await a.read());
+      const key = getConversationKey(hexToBytes(config.secret), left.pubkey);
+      expect(
+        [...relay.events.values()]
+          .filter(isHead)
+          .map((head) => JSON.parse(decrypt(head.content, key)).version),
+      ).toEqual([2, 2]);
+    } finally {
+      await relay.close();
+    }
   });
   it("rejects malformed codes, insecure relays, and cross-wallet reconfiguration", async () => {
     expect(() => importSyncCode("bad")).toThrow();
