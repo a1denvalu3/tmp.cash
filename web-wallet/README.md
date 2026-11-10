@@ -222,10 +222,11 @@ npm run test:e2e:cloud:production
 ```
 
 Build produces a static `dist/` with separate `index.html`,
-`how-it-works/index.html`, and `wallet/index.html`
+`how-it-works/index.html`, `privacy/index.html`, `terms/index.html`, and
+`wallet/index.html`
 entries, each with a Content Security Policy. Serve the complete directory from
 the same origin so the landing page and wallet share browser preferences and
-existing IndexedDB funds. The `/wallet/` and `/how-it-works/` entries support direct visits and reloads
+existing IndexedDB funds. The `/wallet/`, `/how-it-works/`, `/privacy/`, and `/terms/` entries support direct visits and reloads
 without requiring a server-side SPA fallback. `npm test` runs
 cross-language integration tests against a disposable Python mint, including
 private swaps, combined melts, fee change, deadlines, double-spend reservations,
@@ -266,6 +267,12 @@ and management rather than the initial setup form.
    Google's token popup flow, so `/api/cloud/callback/google` is no longer used.
    Only `openid`, `email`, and `https://www.googleapis.com/auth/drive.appdata`
    are requested. The app-data scope does not grant access to other Drive files.
+   Set the OAuth Branding privacy policy URL to `https://tmp.cash/privacy/`
+   after deploying the wallet. The policy is public and linked from the site,
+   wallet footer, and backup setup. It explains browser storage, direct cloud
+   backups, and the mint's separate ecash protocol records.
+   Set the Terms of Service URL to `https://tmp.cash/terms/`. Both pages are
+   accessible without sign-in and linked from the public site and wallet.
 3. Put the public client ID in `web-wallet/.env.local`:
 
    ```dotenv

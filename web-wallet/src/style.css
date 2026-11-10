@@ -1003,6 +1003,7 @@ footer {
   padding: 24px 0 31px;
   color: var(--muted);
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: 20px;
@@ -1577,7 +1578,9 @@ input[type="file"] {
   padding: 40px;
   color: var(--muted);
 }
-.app-shell footer .wallet-learn-link {
+.app-shell footer .wallet-learn-link,
+.app-shell footer .wallet-privacy-link,
+.app-shell footer .wallet-terms-link {
   display: inline-flex;
   min-height: 44px;
   text-decoration: none;

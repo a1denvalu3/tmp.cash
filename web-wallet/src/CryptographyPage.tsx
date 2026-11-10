@@ -151,7 +151,7 @@ export function CryptographyPage() {
         Skip to content
       </a>
       <div className="landing-shell">
-        <PublicPageHeader cryptography />
+        <PublicPageHeader page="cryptography" />
         <main id="main">
           <section className="crypto-hero" aria-labelledby="crypto-title">
             <span className="eyebrow hero-eyebrow">
