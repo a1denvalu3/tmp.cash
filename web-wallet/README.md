@@ -185,7 +185,10 @@ and an unspent nullifier are required before restoring spendable value. Outgoing
 tokens stay excluded from the balance, and closed backing stays unusable.
 Slow background refreshes share one pending request instead of filling the
 operation queue. Funding polling continues with other deposits if one quote
-cannot be checked, and saved issuance requests replay even after backing closes.
+cannot be checked. Unpaid invoices past their saved expiry appear as **Expired**
+in deposit history and are never polled, including after reload or while offline.
+Accepted payments keep their separate backing deadline, and saved issuance
+requests replay even after backing closes.
 That replay recovers records; it does not make genuinely expired tokens spendable.
 
 Operations save secrets and the **exact request before any spending POST**.

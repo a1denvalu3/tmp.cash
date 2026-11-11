@@ -14,7 +14,7 @@ import {
   psInvoiceDetails,
   type PSToken,
 } from "@cashu/cashu-ts/tmp-cash";
-import { TmpCashManager } from "coco-cashu-core/tmp-cash";
+import { TmpCashManager, tmpCashFundingStatus } from "coco-cashu-core/tmp-cash";
 import { TmpCashIndexedDbRepository } from "coco-cashu-indexeddb/tmp-cash";
 import { denominationKeysetId } from "../packages/cashu-ts/src/tmp-cash/crypto";
 import {
@@ -84,6 +84,58 @@ afterAll(async () => {
 });
 
 describe("Python mint ↔ browser cashu-ts protocol", () => {
+  it("stops checking unpaid quotes at invoice expiry, including after restart", async () => {
+    const repo = repository(),
+      fetcher = vi.fn(fetch),
+      manager = new TmpCashManager(repo, mintUrl, fetcher);
+    await manager.init();
+    const funding = await manager.createFunding(32, 60);
+    const clock = vi
+      .spyOn(Date, "now")
+      .mockReturnValue(funding.quote!.expiry * 1000 - 1);
+    try {
+      fetcher.mockClear();
+      await manager.pollFunding(funding.id);
+      expect(fetcher).toHaveBeenCalledOnce();
+      expect(tmpCashFundingStatus(funding)).toBe("waiting");
+
+      clock.mockReturnValue(funding.quote!.expiry * 1000);
+      fetcher.mockClear();
+      await manager.pollFunding(funding.id);
+      expect(tmpCashFundingStatus(funding)).toBe("expired");
+      expect(fetcher).not.toHaveBeenCalled();
+
+      const restarted = new TmpCashManager(repo, mintUrl, fetcher);
+      await restarted.init();
+      fetcher.mockClear();
+      await restarted.pollFunding(funding.id);
+      expect(fetcher).not.toHaveBeenCalled();
+      expect(tmpCashFundingStatus((await repo.read()).fundings[0])).toBe(
+        "expired",
+      );
+    } finally {
+      clock.mockRestore();
+    }
+  });
+  it("claims accepted funding after its invoice deadline", async () => {
+    const repo = repository(),
+      manager = new TmpCashManager(repo, mintUrl);
+    await manager.init();
+    const funding = await manager.createFunding(32);
+    await control("accept", { payment_hash: funding.id });
+    funding.quote = await wallet.getMintQuote(funding.quote!.quote);
+    await repo.updateFunding(funding);
+    const clock = vi
+      .spyOn(Date, "now")
+      .mockReturnValue(funding.quote.expiry * 1000);
+    try {
+      expect(tmpCashFundingStatus(funding)).toBe("waiting");
+      expect((await manager.pollFunding(funding.id)).state).toBe("minted");
+      expect((await repo.read()).activity).toHaveLength(1);
+    } finally {
+      clock.mockRestore();
+    }
+  });
   it("persists complete deposit, transfer, and combined-payment history through encrypted backups", async () => {
     const alice = new TmpCashManager(repository(), mintUrl);
     const bobRepo = repository(),
@@ -556,7 +608,21 @@ describe("Coco operation journal and IndexedDB", () => {
     await control("settle", { payment_hash: funding.id });
     const restarted = new TmpCashManager(repo, mintUrl);
     await restarted.init();
-    expect((await restarted.pollFunding(funding.id)).state).toBe("minted");
+    // A stale quote observation must not hide the saved issuance journal.
+    const saved = (await repo.read()).fundings[0];
+    saved.quote = { ...saved.quote!, state: "OPEN" };
+    await repo.updateFunding(saved);
+    const clock = vi
+      .spyOn(Date, "now")
+      .mockReturnValue(saved.quote.expiry * 1000);
+    try {
+      expect(tmpCashFundingStatus(saved, (await repo.read()).operations)).toBe(
+        "waiting",
+      );
+      expect((await restarted.pollFunding(funding.id)).state).toBe("minted");
+    } finally {
+      clock.mockRestore();
+    }
     expect((await repo.read()).operations).toEqual([]);
     expect((await repo.read()).activity).toHaveLength(1);
     expect((await restarted.view()).balance).toBe(0);

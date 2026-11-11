@@ -31,6 +31,7 @@ import {
 import QRCode from "qrcode";
 import {
   TmpCashManager,
+  tmpCashFundingStatus,
   type TmpCashFunding,
   type TmpCashView,
 } from "coco-cashu-core/tmp-cash";
@@ -474,7 +475,9 @@ export function App() {
       try {
         const state = await repo.read();
         for (const f of state.fundings.filter(
-          (f) => f.mint === mintUrl && f.state === "waiting",
+          (f) =>
+            f.mint === mintUrl &&
+            tmpCashFundingStatus(f, state.operations) === "waiting",
         )) {
           try {
             const result = await diagnoseAction("check-funding", () =>
@@ -626,7 +629,12 @@ export function App() {
   const localFundings = (view?.fundings ?? [])
     .filter((f) => f.mint === mintUrl)
     .sort((a, b) => b.createdAt - a.createdAt);
-  const latestWaitingFunding = localFundings.find((f) => f.state === "waiting");
+  const latestWaitingFunding = localFundings.find(
+    (f) => tmpCashFundingStatus(f, localOperations) === "waiting",
+  );
+  const fundingStatus = funding
+    ? tmpCashFundingStatus(funding, localOperations)
+    : null;
   const groups = Object.values(
     (view?.proofs ?? [])
       .filter((p) => p.mint === mintUrl && p.state === "ready")
@@ -1384,11 +1392,14 @@ export function App() {
                       </time>
                     </span>
                     <span className="small muted">
-                      {f.state === "minted"
-                        ? "Funded"
-                        : f.state === "closed"
-                          ? "Closed"
-                          : "Awaiting payment"}
+                      {
+                        {
+                          minted: "Funded",
+                          closed: "Closed",
+                          expired: "Expired",
+                          waiting: "Awaiting payment",
+                        }[tmpCashFundingStatus(f, localOperations)]
+                      }
                     </span>
                     <ChevronRight size={16} />
                   </button>
@@ -1437,7 +1448,7 @@ export function App() {
                   Create funding invoice
                 </button>
               </form>
-            ) : funding.state === "minted" ? (
+            ) : fundingStatus === "minted" ? (
               <div className="success-state">
                 <CheckCircle2 size={48} />
                 <h3>{format(funding.amount)} sats received</h3>
@@ -1446,10 +1457,14 @@ export function App() {
                   Back to wallet
                 </button>
               </div>
-            ) : funding.state === "closed" ? (
+            ) : fundingStatus === "closed" || fundingStatus === "expired" ? (
               <div className="success-state">
                 <Clock3 size={42} />
-                <h3>This invoice has closed.</h3>
+                <h3>
+                  {fundingStatus === "expired"
+                    ? "This invoice has expired."
+                    : "This invoice has closed."}
+                </h3>
                 <button
                   className="button dark full"
                   onClick={() => setFunding(null)}

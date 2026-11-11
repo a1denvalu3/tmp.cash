@@ -20,6 +20,7 @@ import {
   type PSSnapshot,
 } from "@cashu/cashu-ts/tmp-cash";
 import { EventBus } from "../events/EventBus";
+import { tmpCashFundingStatus } from "./funding";
 import type {
   TmpCashRepository,
   TmpCashView,
@@ -299,6 +300,7 @@ export class TmpCashManager {
         await this.execute(pending);
         return (await this.repo.read()).fundings.find((f) => f.id === id)!;
       }
+      if (tmpCashFundingStatus(funding) === "expired") return funding;
       funding.quote = funding.quote
         ? await this.wallet.getMintQuote(funding.quote.quote)
         : await this.wallet.createMintQuote(

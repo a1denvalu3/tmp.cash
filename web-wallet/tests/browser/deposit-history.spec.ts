@@ -9,6 +9,77 @@ test.beforeEach(async ({ page }) => {
   }, mintUrl);
 });
 
+test("shows expired invoices without polling them across reloads and offline", async ({
+  page,
+}) => {
+  let expiry = 0;
+  const checks: string[] = [];
+  page.on("request", (request) => {
+    if (request.url().startsWith(mintUrl + "/v1/mint/quote/bolt11/"))
+      checks.push(request.url());
+  });
+  await page.route(mintUrl + "/v1/mint/quote/bolt11", async (route) => {
+    const response = await route.fetch();
+    expiry = (await response.json()).expiry;
+    await route.fulfill({ response });
+  });
+  await page.goto("/wallet/");
+  await expect(page.getByText("Mint connected", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Add sats", exact: true }).click();
+  await page.getByLabel("Amount in sats").fill("32");
+  await page.getByRole("button", { name: "Create funding invoice" }).click();
+  await expect(page.getByLabel("Funding invoice")).toHaveValue(/^lnbcrt/);
+
+  await page.clock.setFixedTime(expiry * 1000 - 1);
+  await page.getByRole("button", { name: "Check payment" }).click();
+  await expect(
+    page.getByRole("button", { name: "Check payment" }),
+  ).toBeEnabled();
+  expect(checks.length).toBeGreaterThan(0);
+  const beforeExpiry = checks.length;
+  await page.clock.setFixedTime(expiry * 1000);
+  await expect(
+    page.getByRole("heading", { name: "This invoice has expired." }),
+  ).toBeVisible();
+  await expect(page.getByRole("button", { name: "Check payment" })).toHaveCount(
+    0,
+  );
+  await expect(page.getByLabel("Funding invoice")).toHaveCount(0);
+  await page
+    .getByRole("button", { name: "Deposit invoice history", exact: true })
+    .click();
+  const history = page.getByRole("list", { name: "Deposit invoices" });
+  await expect(history.getByRole("button", { name: /^32 sats/ })).toContainText(
+    "Expired",
+  );
+  // Observe more than two polling intervals, then repeat after reopening storage.
+  await page.waitForTimeout(6500);
+  expect(checks).toHaveLength(beforeExpiry);
+  await page.reload();
+  await expect(page.getByText("Mint connected", { exact: true })).toBeVisible();
+  await expect(page.locator(".funding-row")).toHaveCount(0);
+  await page
+    .getByRole("button", { name: "Deposit invoice history (1)" })
+    .click();
+  await expect(history.getByText("Expired", { exact: true })).toBeVisible();
+  await page.waitForTimeout(6500);
+  expect(checks).toHaveLength(beforeExpiry);
+
+  await page.route(mintUrl + "/**", (route) => route.abort("failed"));
+  await page.reload();
+  await expect(page.getByText("Mint offline", { exact: true })).toBeVisible();
+  await expect(page.locator(".funding-row")).toHaveCount(0);
+  await page
+    .getByRole("button", { name: "Deposit invoice history (1)" })
+    .click();
+  await expect(history.getByText("Expired", { exact: true })).toBeVisible();
+  await history.getByRole("button", { name: /^32 sats/ }).click();
+  await expect(
+    page.getByRole("heading", { name: "This invoice has expired." }),
+  ).toBeVisible();
+  expect(checks).toHaveLength(beforeExpiry);
+});
+
 test("shows only the latest waiting invoice and keeps the full deposit history", async ({
   page,
 }) => {
