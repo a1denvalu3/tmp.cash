@@ -19,6 +19,8 @@ import {
   exportSyncCode,
   importSyncCode,
   NostrWalletSync,
+  clearEmptySyncSetup,
+  readSyncSettings,
   saveSyncSettings,
   type NostrSyncSettings,
   type RelayIO,
@@ -456,6 +458,123 @@ describe("durable migration and immutable journal validation", () => {
     expect((await b.readSyncFacts()).some((f) => f.id === fresh.id)).toBe(
       false,
     );
+  });
+});
+
+describe("returning an unused wallet to sync setup", () => {
+  it("clears empty setup, document, and pending uploads so another wallet can be paired", async () => {
+    const repo = repository(),
+      io = new MemoryRelay();
+    const config = createSyncSettings(["wss://buzz.cashu.space"], mint);
+    await saveSyncSettings(repo, config);
+    const worker = new NostrWalletSync(repo, config, io);
+    workers.push(worker);
+    io.fail = true;
+    await expect(worker.flush()).rejects.toThrow("Relay unavailable");
+    expect(await repo.syncData.get("pending")).toBeDefined();
+    await repo.syncData.put({ id: "paused", value: true });
+    await clearEmptySyncSetup(repo);
+    expect(await repo.read()).toEqual(emptyWalletState());
+    expect(await repo.syncData.toArray()).toEqual([]);
+    expect(await repo.readSyncFacts()).toEqual([]);
+    const replacement = createSyncSettings(["wss://buzz.cashu.space"], mint);
+    await saveSyncSettings(repo, replacement);
+    io.fail = false;
+    await expect(worker.flush()).rejects.toThrow("settings changed");
+    await expect(worker.synchronize()).rejects.toThrow("settings changed");
+    expect(io.events.size).toBe(0);
+    expect(await readSyncSettings(repo)).toEqual(replacement);
+  });
+
+  for (const retained of [
+    "wallet",
+    "journal",
+    "document",
+    "terminal",
+  ] as const) {
+    it(`preserves setup when ${retained} contains financial or recovery records`, async () => {
+      const repo = repository();
+      const config = createSyncSettings(["wss://buzz.cashu.space"], mint);
+      await saveSyncSettings(repo, config);
+      if (retained === "terminal") {
+        await repo.syncFacts.add({
+          id: crypto.randomUUID(),
+          state: emptyWalletState(),
+          terminal: { id: psRandomHex(), state: "released" },
+        });
+      } else {
+        await funding(repo);
+        await createWalletSyncBackup(repo, mint);
+        if (retained !== "wallet") await repo.fundings.clear();
+        if (retained === "document") await repo.syncFacts.clear();
+      }
+      const before = {
+        state: await repo.read(),
+        facts: await repo.readSyncFacts(),
+        data: await repo.syncData.toArray(),
+      };
+      await expect(clearEmptySyncSetup(repo)).rejects.toThrow(
+        "funds, history, or recovery records",
+      );
+      expect({
+        state: await repo.read(),
+        facts: await repo.readSyncFacts(),
+        data: await repo.syncData.toArray(),
+      }).toEqual(before);
+    });
+  }
+
+  it("rolls back the whole reset if clearing metadata fails", async () => {
+    const repo = repository();
+    await saveSyncSettings(
+      repo,
+      createSyncSettings(["wss://buzz.cashu.space"], mint),
+    );
+    const facts = await repo.readSyncFacts(),
+      data = await repo.syncData.toArray();
+    const clear = vi
+      .spyOn(repo.syncData, "clear")
+      .mockRejectedValueOnce(new Error("write failed"));
+    try {
+      await expect(clearEmptySyncSetup(repo)).rejects.toThrow("write failed");
+      expect(await repo.readSyncFacts()).toEqual(facts);
+      expect(await repo.syncData.toArray()).toEqual(data);
+    } finally {
+      clear.mockRestore();
+    }
+  });
+
+  it("checks membership after waiting for the cross-tab relay lock", async () => {
+    const repo = repository(),
+      io = new MemoryRelay();
+    const config = createSyncSettings(["wss://buzz.cashu.space"], mint);
+    await saveSyncSettings(repo, config);
+    let enter!: () => Promise<void>;
+    vi.stubGlobal("navigator", {
+      locks: {
+        request: (_: string, fn: () => Promise<void>) =>
+          new Promise<void>((resolve, reject) => {
+            enter = async () => {
+              try {
+                resolve(await fn());
+              } catch (error) {
+                reject(error);
+              }
+            };
+          }),
+      },
+    });
+    const worker = new NostrWalletSync(repo, config, io);
+    workers.push(worker);
+    const task = worker.flush();
+    const rejected = expect(task).rejects.toThrow("settings changed");
+    await vi.waitFor(() => expect(enter).toBeTypeOf("function"));
+    await repo.syncData.delete("settings");
+    const replacement = createSyncSettings(["wss://buzz.cashu.space"], mint);
+    await saveSyncSettings(repo, replacement);
+    await enter();
+    await rejected;
+    expect(io.events.size).toBe(0);
   });
 });
 
